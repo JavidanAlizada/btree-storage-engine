@@ -10,4 +10,16 @@
         <Method name="buffer"/>
         <Bug pattern="EI_EXPOSE_REP"/>
     </Match>
+    <!--
+      The buffer pool works on the PageFile and Replacer it's given; they're
+      collaborators shared on purpose, not internal state to copy.
+    -->
+    <Match>
+        <Class name="dev.storage.buffer.BufferPool"/>
+        <Or>
+            <Field name="file"/>
+            <Field name="replacer"/>
+        </Or>
+        <Bug pattern="EI_EXPOSE_REP2"/>
+    </Match>
 </FindBugsFilter>
