@@ -52,7 +52,11 @@ public final class PageFile implements AutoCloseable {
             throw new IllegalArgumentException("page size must be a power of two from " + PageHeader.MIN_PAGE_SIZE
                     + " to " + PageHeader.MAX_PAGE_SIZE + ": " + pageSize);
         }
-        FileChannel channel = openChannel(path, StandardOpenOption.CREATE_NEW);
+        return create(openChannel(path, StandardOpenOption.CREATE_NEW), pageSize);
+    }
+
+    // The channel is a seam for tests that inject I/O faults.
+    static PageFile create(FileChannel channel, int pageSize) {
         var file = new PageFile(channel, new MetaPage(pageSize, 1, 0, 0, 0));
         file.lock.lock();
         try {
@@ -70,7 +74,10 @@ public final class PageFile implements AutoCloseable {
 
     /** Opens an existing file, checking its format and meta page. */
     public static PageFile open(Path path) {
-        FileChannel channel = openChannel(path);
+        return open(openChannel(path), path);
+    }
+
+    static PageFile open(FileChannel channel, Path path) {
         try {
             ByteBuffer prefix = ByteBuffer.allocate(MetaPage.PREFIX_SIZE);
             readFully(channel, prefix, 0, "the file header");
