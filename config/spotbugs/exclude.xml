@@ -22,4 +22,12 @@
         </Or>
         <Bug pattern="EI_EXPOSE_REP2"/>
     </Match>
+    <!--
+      Tests use seeded Randoms on purpose, so a failure can be replayed from
+      its seed. The detector also misfires on Randoms used inside loops.
+    -->
+    <Match>
+        <Class name="~.*Test"/>
+        <Bug pattern="DMI_RANDOM_USED_ONLY_ONCE"/>
+    </Match>
 </FindBugsFilter>
