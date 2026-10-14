@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<!DOCTYPE import-control PUBLIC
+    "-//Checkstyle//DTD ImportControl Configuration 1.4//EN"
+    "https://checkstyle.org/dtds/import_control_1_4.dtd">
+
+<!--
+  Layering from the design, bottom up: page formats, then the page file.
+  A lower layer never reaches up into a higher one. Later layers (buffer pool,
+  B+Tree, WAL) are added here as they arrive. Everything not disallowed is allowed.
+-->
+<import-control pkg="dev.storage" strategyOnMismatch="allowed">
+    <subpackage name="page">
+        <disallow pkg="dev.storage.file"/>
+    </subpackage>
+</import-control>
