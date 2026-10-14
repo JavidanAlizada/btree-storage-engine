@@ -133,11 +133,17 @@ public final class PageFile implements AutoCloseable {
         writePage(id, src);
     }
 
-    /** A new page, formatted as FREE, at the end of the file. */
+    /**
+     * A page for the caller to format and write: the most recently freed page if there is one, otherwise a new page
+     * at the end of the file. Either way it reads back as a FREE page until written.
+     */
     public int allocate() {
         checkUsable();
         lock.lock();
         try {
+            if (meta.freeListHead != 0) {
+                return popFree();
+            }
             int id = meta.pageCount;
             if (id == -1) {
                 throw new IllegalStateException("the file has the maximum of 2^32 - 1 pages");
@@ -153,6 +159,49 @@ public final class PageFile implements AutoCloseable {
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * Returns page id to the free list, overwriting it as a FREE page that links to the previous head. The caller must
+     * not free a page twice or keep using it: neither is detected, and a double free makes the list a cycle.
+     */
+    public void free(int id) {
+        checkUsable();
+        if (id == 0 || Integer.compareUnsigned(id, pageCount) >= 0) {
+            throw new IllegalArgumentException("can't free page " + Integer.toUnsignedString(id));
+        }
+        lock.lock();
+        try {
+            ByteBuffer page = ByteBuffer.allocate(pageSize);
+            PageHeader.format(page, id, PageType.FREE);
+            PageHeader.setAux(page, meta.freeListHead);
+            writePage(id, page);
+            meta.freeListHead = id;
+            metaDirty = true;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    // The head of the free list, read to learn the next one. Called with the lock held.
+    private int popFree() {
+        int id = meta.freeListHead;
+        String which = "free-list page " + Integer.toUnsignedString(id);
+        if (Integer.compareUnsigned(id, meta.pageCount) >= 0) {
+            throw new CorruptPageException(which + " is past the end of the file");
+        }
+        ByteBuffer page = ByteBuffer.allocate(pageSize);
+        read(id, page);
+        if (PageHeader.type(page) != PageType.FREE) {
+            throw new CorruptPageException(which + " is a " + PageHeader.type(page) + " page, not a free one");
+        }
+        int next = PageHeader.aux(page);
+        if (next == id || Integer.compareUnsigned(next, meta.pageCount) >= 0) {
+            throw new CorruptPageException(which + " links to page " + Integer.toUnsignedString(next));
+        }
+        meta.freeListHead = next;
+        metaDirty = true;
+        return id;
     }
 
     /** Writes the meta page if it changed, then forces the file to disk. An fsync failure is final. */
