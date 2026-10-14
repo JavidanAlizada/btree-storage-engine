@@ -1,3 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <FindBugsFilter>
+    <!--
+      SlottedPage is a view over a page buffer the caller owns (a buffer pool
+      frame from M2 on). Handing that same buffer back is the point; copying
+      it would defeat in-place page access.
+    -->
+    <Match>
+        <Class name="dev.storage.page.SlottedPage"/>
+        <Method name="buffer"/>
+        <Bug pattern="EI_EXPOSE_REP"/>
+    </Match>
 </FindBugsFilter>
