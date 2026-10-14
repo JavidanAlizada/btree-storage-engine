@@ -4,12 +4,17 @@
     "https://checkstyle.org/dtds/import_control_1_4.dtd">
 
 <!--
-  Layering from the design, bottom up: page formats, then the page file.
+  Layering from the design, bottom up: page formats, then the page file, then
+  the buffer pool.
   A lower layer never reaches up into a higher one. Later layers (buffer pool,
   B+Tree, WAL) are added here as they arrive. Everything not disallowed is allowed.
 -->
 <import-control pkg="dev.storage" strategyOnMismatch="allowed">
     <subpackage name="page">
         <disallow pkg="dev.storage.file"/>
+        <disallow pkg="dev.storage.buffer"/>
+    </subpackage>
+    <subpackage name="file">
+        <disallow pkg="dev.storage.buffer"/>
     </subpackage>
 </import-control>
