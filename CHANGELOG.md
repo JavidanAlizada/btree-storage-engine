@@ -6,6 +6,34 @@ per milestone, not per commit.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-10-15
+
+### Milestone 2 — Buffer pool
+
+- `dev.storage.buffer.BufferPool`: a fixed set of frames over one
+  `PageFile`. `fetch`, `newPage` (formatted in memory, no read), `free`,
+  `flush`, `flushAll`, `stats`, and `close`, which reports leaked pins.
+- `PageGuard`: one pin per guard, with a separate shared/exclusive latch
+  per frame. The bytes are readable only under a latch, and `markDirty`
+  needs the exclusive one. `close()` releases both.
+- One pool lock for the table, pins and replacer, with no I/O under it.
+  A page being loaded is in the table before its read, so concurrent
+  fetchers wait for that one read. A failed load reaches every waiter, and
+  the frame returns to the pool.
+- Dirty eviction keeps the victim mapped and pinned, copies it under the
+  shared latch, writes the copy with no latch or lock held, and reuses the
+  frame only if nobody touched it meanwhile.
+- `Replacer` with `LruReplacer` (an intrusive list, by release order) and
+  `ClockReplacer` (second chance).
+- `BufferPoolFullException` when every frame is pinned (fail fast, no wait).
+- Frames are slices of direct-memory arenas allocated once.
+- Tests: replacer unit and model tests, pool unit tests, an 8-thread
+  eviction stress test with counters (it fails at once if the eviction
+  protocol is broken on purpose), and a corrupt page fetched by many
+  threads at once.
+- Not yet: the WAL rule on eviction (M4); no performance claims before
+  the M6 benchmarks.
+
 ## [0.1.0] — 2026-10-15
 
 ### Milestone 1 — Pages and the page file

@@ -14,14 +14,16 @@ latch coupling) and to write the reasoning down next to the code.
 | Milestone | Scope | State |
 |---|---|---|
 | M1 | Pages and the page file | **Done (0.1.0)** |
-| M2 | Buffer pool: frames, pin/unpin, LRU and Clock | Next |
-| M3 | B+Tree: split, merge, range scans, composite keys | Planned |
+| M2 | Buffer pool: frames, pin/unpin, LRU and Clock | **Done (0.2.0)** |
+| M3 | B+Tree: split, merge, range scans, composite keys | Next |
 | M4 | Write-ahead log and crash recovery | Planned |
 | M5 | Concurrent B+Tree (latch crabbing) | Planned |
 | M6 | Benchmarks (JMH), demo, close-out | Planned |
 
-There is no key-value API yet. What exists today is the bottom layer: a file
-of checksummed pages and the slotted-page format every tree node will use.
+There is no key-value API yet. What exists today are the bottom two layers: a
+file of checksummed pages with the slotted-page format every tree node will
+use, and a buffer pool that caches those pages and decides when they go back
+to disk.
 
 **Not crash-safe yet.** A crash between growing the file (or changing the
 free list) and writing the meta page can leak a page or lose a free-list
@@ -118,6 +120,64 @@ try (PageFile file = PageFile.create(Path.of("data.db"), 8192)) {
   buffer pool, from M2) guarantees one writer per page. Allocation, free
   and the meta page share one lock.
 
+## The buffer pool
+
+```java
+try (BufferPool pool = new BufferPool(file, 1024, new ClockReplacer(1024))) {
+    try (PageGuard page = pool.fetch(id)) {      // pinned: stays in its frame
+        page.latchShared();                      // the bytes are stable
+        SlottedPage.wrap(page.buffer()).cellBytes(0);
+    }                                            // unlatched and unpinned
+    try (PageGuard page = pool.newPage()) {
+        page.latchExclusive();
+        PageHeader.format(page.buffer(), page.pageId(), PageType.LEAF);
+        page.markDirty();
+    }
+}
+```
+
+**Pins and latches are separate.** A pin keeps a page in its frame, and a
+latch (a read-write lock per frame) keeps its bytes consistent. The bytes
+may only be read under a latch and changed under the exclusive one. A
+B+Tree needs them apart: crabbing pins a child before releasing its
+parent's latch, and a split holds pins longer than latches. `PageGuard`
+holds one pin, and closing it releases the latch and the pin. A guard
+that's never closed is reported by `pool.close()`.
+
+**One pool lock, no I/O under it.** A single lock guards the page table,
+the free frames, the pin counts and the replacer, and it's held only for
+map and list operations. A page being loaded goes into the table before the
+read starts, so a second thread that wants it waits for that read. A page
+never has two frames, and is never read twice at once. If the load fails
+(a corrupt page), every waiter gets the same exception and the frame goes
+back to the pool.
+
+**Writing a dirty victim without losing an update.** The page has to
+stay findable while it's being written. Otherwise a concurrent fetch would
+read the old version from disk, and a change would be lost. So the victim
+stays mapped and pinned, its bytes are copied under the shared latch (and
+`dirty` cleared at that moment), and the copy is written with no latch or
+lock held. Afterwards the frame is reused only if nobody pinned or changed
+it meanwhile. The stress test catches it if this is broken: with the frame
+unmapped before the write, updates go missing within seconds.
+
+**Replacers.** `LruReplacer` keeps evictable frames in an intrusive
+doubly-linked list over frame indices (O(1), no allocation), ordered by when
+they were released. `ClockReplacer` is the second-chance approximation that
+PostgreSQL uses. A hit sets a bit instead of relinking a list. Both are
+there so M6 can compare them on hit rate and throughput; neither is claimed
+to be better before that.
+
+**All frames pinned fails fast** with `BufferPoolFullException`, instead
+of waiting. A full pool is a leaked guard or a pool smaller than threads ×
+pages held per thread (the tree height, from M3). Waiting would turn a
+leak into a hang.
+
+Frames are slices of one direct-memory arena (up to 1 GiB per arena),
+allocated once, so the pool's footprint is fixed and outside the heap the
+GC scans. The pool doesn't own the `PageFile`: closing the pool flushes
+it, and whoever opened the file closes it.
+
 ## Design decisions
 
 **`FileChannel`, not `mmap`.** The engine must decide when a dirty page
@@ -141,6 +201,17 @@ descriptors) is better at finding contiguous runs and spotting leaks.
 Nothing in Phase 1 needs contiguous pages, and the list needs no extra
 page type.
 
+**One pool lock, not a lock-free page table.** A `ConcurrentHashMap`
+table with per-frame state machines would let hits avoid a shared lock.
+Eviction then races lookups, and it needs CAS transitions that are much
+harder to get right. Without a benchmark showing the lock is contended,
+that's an optimization without evidence. It's the first candidate if
+M6's numbers point there.
+
+**Copy, then write, on eviction.** Writing straight from the frame would
+save an 8 KiB copy, but it would mean holding the latch across disk I/O, or
+stamping the checksum into a page that readers are looking at.
+
 **Big-endian, fixed-width fields.** These are the `ByteBuffer` defaults.
 Byte order on disk matters only for portability, and a fixed width keeps
 every field at a fixed offset.
@@ -162,6 +233,17 @@ every field at a fixed offset.
   bytes exactly, and those bytes must still open. A failure means the
   on-disk format changed, which needs a new format version.
 * Concurrent reads and writes of different pages from 8 threads.
+* Replacer tests: LRU order, Clock's second chance, and a random model that
+  checks no pinned frame is ever chosen.
+* Buffer pool tests: hits and misses, dirty pages surviving eviction and
+  reopen, LRU order seen through misses, pool full, a leaked pin at close,
+  `free` refused while others hold pins.
+* A stress test: 8 threads on 64 pages through 10 frames. Nearly every
+  fetch evicts a dirty page, and every page is a counter bumped under its
+  exclusive latch. The totals must match in the pool and after reopening.
+  Breaking the eviction protocol on purpose makes it fail at once.
+* A corrupt page fetched by 8 threads at once: all of them get the error,
+  and no pin is left behind.
 
 No mutation testing. That's a scope decision; the model and fault tests
 cover the bugs that matter here.
