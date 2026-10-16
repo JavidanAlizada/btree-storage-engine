@@ -57,6 +57,16 @@ public final class SlottedPage {
         return Math.max(0, totalFree(slotCount()) - SLOT_SIZE);
     }
 
+    /** Bytes the cells and their slots take: what a full page would need for the same entries after compaction. */
+    public int usedBytes() {
+        return capacity() - totalFree(slotCount());
+    }
+
+    /** Bytes available to cells and slots in an empty page. */
+    public int capacity() {
+        return pageSize - PageHeader.SIZE;
+    }
+
     public int cellLength(int index) {
         checkIndex(index, slotCount());
         return PageHeader.getU16(page, slotOffset(index) + 2);
