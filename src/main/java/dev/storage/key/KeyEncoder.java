@@ -41,7 +41,7 @@ public final class KeyEncoder {
         put(VALUE);
         int v = value ^ Integer.MIN_VALUE;
         for (int shift = 24; shift >= 0; shift -= 8) {
-            put((byte) (v >>> shift));
+            put((byte) (v >> shift)); // the cast keeps the low byte, so the shift kind is irrelevant
         }
         return this;
     }
@@ -50,7 +50,7 @@ public final class KeyEncoder {
         put(VALUE);
         long v = value ^ Long.MIN_VALUE;
         for (int shift = 56; shift >= 0; shift -= 8) {
-            put((byte) (v >>> shift));
+            put((byte) (v >> shift)); // the cast keeps the low byte, so the shift kind is irrelevant
         }
         return this;
     }

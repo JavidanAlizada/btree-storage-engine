@@ -10,7 +10,7 @@ public final class KeyDecoder {
     private int at;
 
     public KeyDecoder(byte[] key) {
-        this.key = key;
+        this.key = key.clone();
     }
 
     public boolean hasRemaining() {
