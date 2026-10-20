@@ -4,46 +4,59 @@ import dev.storage.buffer.BufferPool;
 import dev.storage.buffer.PageGuard;
 import dev.storage.page.PageType;
 import dev.storage.page.SlottedPage;
+import dev.storage.wal.Mtr;
+import dev.storage.wal.PageStore;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
- * A B+Tree of unique byte keys and byte values, stored in buffer pool pages. Keys compare as unsigned bytes.
+ * A B+Tree of unique byte keys and byte values, stored in logged pages. Keys compare as unsigned bytes. Every change
+ * is one mini-transaction, so a split or merge reaches the log, and recovery, whole or not at all.
  *
  * The root page never moves: a root split moves its contents into two new children, and a root left with one child
  * takes that child's contents back. So the root id recorded when the tree was created stays valid for its whole life.
  *
  * Concurrency for now: many readers or one writer, through one lock per tree. Page latches are still taken as the
- * buffer pool requires. Latch crabbing replaces the tree lock in M5.
+ * buffer pool requires. Latch crabbing replaces the tree lock in M5. A writer begins its mini-transaction before it
+ * takes the tree lock, the order PageStore requires.
  */
 public final class BTree {
 
+    private final PageStore store;
     private final BufferPool pool;
     private final int root;
     private final int maxCell;
     private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
-    private BTree(BufferPool pool, int root, int pageSize) {
-        this.pool = pool;
+    private BTree(PageStore store, int root) {
+        this.store = store;
+        this.pool = store.pool();
         this.root = root;
-        this.maxCell = SlottedPage.maxCellSize(pageSize);
+        this.maxCell = SlottedPage.maxCellSize(store.pageSize());
     }
 
     /** A new, empty tree: one root leaf. */
-    public static BTree create(BufferPool pool, int pageSize) {
-        try (PageGuard page = pool.newPage()) {
-            page.latchExclusive();
-            Node.rewrite(page.buffer(), page.pageId(), PageType.LEAF, 0, List.of());
-            page.markDirty();
-            return new BTree(pool, page.pageId(), pageSize);
+    public static BTree create(PageStore store) {
+        try (Mtr mtr = store.begin()) {
+            BTree tree = create(store, mtr);
+            mtr.commit();
+            return tree;
+        }
+    }
+
+    /** A new, empty tree, made inside the caller's mini-transaction. */
+    public static BTree create(PageStore store, Mtr mtr) {
+        try (PageGuard page = mtr.allocate()) {
+            rewrite(mtr, page, PageType.LEAF, 0, List.of());
+            return new BTree(store, page.pageId());
         }
     }
 
     /** The tree whose root is page root. */
-    public static BTree open(BufferPool pool, int root, int pageSize) {
-        return new BTree(pool, root, pageSize);
+    public static BTree open(PageStore store, int root) {
+        return new BTree(store, root);
     }
 
     public int rootPage() {
@@ -83,6 +96,41 @@ public final class BTree {
 
     /** Stores value under key, replacing any value already there. */
     public void put(byte[] key, byte[] value) {
+        checkSizes(key, value);
+        try (Mtr mtr = store.begin()) {
+            put(mtr, key, value);
+            mtr.commit();
+        }
+    }
+
+    /** As put(key, value), inside the caller's mini-transaction, which must commit it. */
+    public void put(Mtr mtr, byte[] key, byte[] value) {
+        checkSizes(key, value);
+        lock.writeLock().lock();
+        try {
+            Path path = new Path();
+            int leaf = descend(key, path);
+            try (PageGuard page = mtr.fetchExclusive(leaf)) {
+                Node node = Node.of(page.buffer());
+                int i = node.search(key);
+                int at = i >= 0 ? i : -(i + 1);
+                if (i >= 0) {
+                    mtr.delete(page, i);
+                }
+                byte[] cell = Node.leafCell(key, value);
+                if (mtr.insert(page, at, cell)) {
+                    return;
+                }
+                List<byte[]> cells = cells(node);
+                cells.add(at, cell);
+                split(mtr, page, true, cells, path);
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    private void checkSizes(byte[] key, byte[] value) {
         if (key.length > maxCell - 6) {
             throw new IllegalArgumentException("key of " + key.length + " bytes is over the " + (maxCell - 6)
                     + "-byte limit");
@@ -91,57 +139,42 @@ public final class BTree {
             throw new IllegalArgumentException("key + value of " + (key.length + value.length)
                     + " bytes is over the " + (maxCell - 2) + "-byte limit; overflow pages aren't supported yet");
         }
-        lock.writeLock().lock();
-        try {
-            Path path = new Path();
-            int leaf = descend(key, path);
-            try (PageGuard page = pool.fetch(leaf)) {
-                page.latchExclusive();
-                Node node = Node.of(page.buffer());
-                int i = node.search(key);
-                int at = i >= 0 ? i : -(i + 1);
-                if (i >= 0) {
-                    node.page().delete(i);
-                }
-                byte[] cell = Node.leafCell(key, value);
-                page.markDirty();
-                if (node.page().insert(at, cell)) {
-                    return;
-                }
-                List<byte[]> cells = cells(node);
-                cells.add(at, cell);
-                split(page, true, cells, path);
-            }
-        } finally {
-            lock.writeLock().unlock();
-        }
     }
 
     /** Removes key. Returns false if it wasn't there. */
     public boolean delete(byte[] key) {
-        lock.writeLock().lock();
-        try {
-            Path path = new Path();
-            int leaf = descend(key, path);
-            boolean rebalance;
-            try (PageGuard page = pool.fetch(leaf)) {
-                page.latchExclusive();
-                Node node = Node.of(page.buffer());
-                int i = node.search(key);
-                if (i < 0) {
-                    return false;
-                }
-                node.page().delete(i);
-                page.markDirty();
-                rebalance = leaf != root && underfull(node);
+        try (Mtr mtr = store.begin()) {
+            boolean found;
+            lock.writeLock().lock();
+            try {
+                found = delete(mtr, key);
+            } finally {
+                lock.writeLock().unlock();
             }
-            if (rebalance) {
-                rebalance(path);
+            if (found) {
+                mtr.commit();
             }
-            return true;
-        } finally {
-            lock.writeLock().unlock();
+            return found;
         }
+    }
+
+    private boolean delete(Mtr mtr, byte[] key) {
+        Path path = new Path();
+        int leaf = descend(key, path);
+        boolean rebalance;
+        try (PageGuard page = mtr.fetchExclusive(leaf)) {
+            Node node = Node.of(page.buffer());
+            int i = node.search(key);
+            if (i < 0) {
+                return false;
+            }
+            mtr.delete(page, i);
+            rebalance = leaf != root && underfull(node);
+        }
+        if (rebalance) {
+            rebalance(mtr, path);
+        }
+        return true;
     }
 
     /** The entries in [from, to) in key order; null leaves that end unbounded. Close the cursor when done. */
@@ -197,24 +230,20 @@ public final class BTree {
      * parent if both fit in one page, otherwise redistributes their cells; then repeats for the parent if that left it
      * underfull.
      */
-    private void rebalance(Path path) {
+    private void rebalance(Mtr mtr, Path path) {
         while (!path.isEmpty()) {
             int parentId = path.lastPage();
             int position = path.lastPosition();
             path.pop();
             boolean parentUnderfull;
-            try (PageGuard parent = pool.fetch(parentId)) {
-                parent.latchExclusive();
+            try (PageGuard parent = mtr.fetchExclusive(parentId)) {
                 Node p = Node.of(parent.buffer());
                 // The right sibling if there is one, else the left: separator s sits between children s - 1 and s.
                 int separator = position < p.count() - 1 ? position + 1 : position;
                 int leftId = p.child(separator - 1);
                 int rightId = p.child(separator);
                 byte[] separatorKey = p.key(separator);
-                parent.markDirty();
-                try (PageGuard left = pool.fetch(leftId); PageGuard right = pool.fetch(rightId)) {
-                    left.latchExclusive();
-                    right.latchExclusive();
+                try (PageGuard left = mtr.fetchExclusive(leftId); PageGuard right = mtr.fetchExclusive(rightId)) {
                     Node l = Node.of(left.buffer());
                     Node r = Node.of(right.buffer());
                     boolean leaf = l.isLeaf();
@@ -223,31 +252,29 @@ public final class BTree {
                         combined.add(Node.internalCell(separatorKey, r.aux())); // the separator comes down
                     }
                     combined.addAll(cells(r));
-                    left.markDirty();
-                    right.markDirty();
                     if (fits(combined, l.capacity())) {
-                        Node.rewrite(left.buffer(), leftId, leaf ? PageType.LEAF : PageType.INTERNAL,
-                                leaf ? r.aux() : l.aux(), combined);
-                        pool.free(right);
-                        p.page().delete(separator);
+                        rewrite(mtr, left, leaf ? PageType.LEAF : PageType.INTERNAL, leaf ? r.aux() : l.aux(),
+                                combined);
+                        mtr.free(right);
+                        mtr.delete(parent, separator);
                         if (parentId == root) {
                             if (p.count() == 0) {
-                                collapseRoot(parent, left);
+                                collapseRoot(mtr, parent, left);
                             }
                             return;
                         }
                         parentUnderfull = underfull(p);
                     } else {
-                        byte[] newSeparator = redistribute(left, right, leaf, l.aux(), r.aux(), combined);
-                        p.page().delete(separator);
+                        byte[] newSeparator = redistribute(mtr, left, right, leaf, l.aux(), r.aux(), combined);
+                        mtr.delete(parent, separator);
                         byte[] cell = Node.internalCell(newSeparator, rightId);
-                        if (!p.page().insert(separator, cell)) {
+                        if (!mtr.insert(parent, separator, cell)) {
                             // The new separator is longer and the parent was full: split it, as an insert would.
                             List<byte[]> parentCells = cells(p);
                             parentCells.add(separator, cell);
                             left.close();
                             right.close();
-                            split(parent, false, parentCells, path);
+                            split(mtr, parent, false, parentCells, path);
                             return;
                         }
                         parentUnderfull = parentId != root && underfull(p);
@@ -261,30 +288,32 @@ public final class BTree {
     }
 
     // Re-splits two siblings' cells by bytes and returns the separator that now goes between them.
-    private byte[] redistribute(PageGuard left, PageGuard right, boolean leaf, int leftAux, int rightAux,
-            List<byte[]> combined) {
+    private static byte[] redistribute(Mtr mtr, PageGuard left, PageGuard right, boolean leaf, int leftAux,
+            int rightAux, List<byte[]> combined) {
         if (leaf) {
             int cut = leafCut(combined);
-            Node.rewrite(left.buffer(), left.pageId(), PageType.LEAF, right.pageId(), combined.subList(0, cut));
-            Node.rewrite(right.buffer(), right.pageId(), PageType.LEAF, rightAux,
-                    combined.subList(cut, combined.size()));
+            rewrite(mtr, left, PageType.LEAF, right.pageId(), combined.subList(0, cut));
+            rewrite(mtr, right, PageType.LEAF, rightAux, combined.subList(cut, combined.size()));
             return Node.cellKey(combined.get(cut));
         }
         int middle = internalCut(combined);
         byte[] up = combined.get(middle);
-        Node.rewrite(left.buffer(), left.pageId(), PageType.INTERNAL, leftAux, combined.subList(0, middle));
-        Node.rewrite(right.buffer(), right.pageId(), PageType.INTERNAL, Node.cellChild(up),
-                combined.subList(middle + 1, combined.size()));
+        rewrite(mtr, left, PageType.INTERNAL, leftAux, combined.subList(0, middle));
+        rewrite(mtr, right, PageType.INTERNAL, Node.cellChild(up), combined.subList(middle + 1, combined.size()));
         return Node.cellKey(up);
     }
 
+    // Formats the page as a node holding cells, logged as an image.
+    private static void rewrite(Mtr mtr, PageGuard page, PageType type, int aux, List<byte[]> cells) {
+        Node.rewrite(page.buffer(), page.pageId(), type, aux, cells);
+        mtr.rewritten(page);
+    }
+
     // An internal root with no separators left has one child: the root takes over its contents, keeping its id.
-    private void collapseRoot(PageGuard rootPage, PageGuard onlyChild) {
+    private static void collapseRoot(Mtr mtr, PageGuard rootPage, PageGuard onlyChild) {
         Node child = Node.of(onlyChild.buffer());
-        Node.rewrite(rootPage.buffer(), root, child.isLeaf() ? PageType.LEAF : PageType.INTERNAL, child.aux(),
-                cells(child));
-        rootPage.markDirty();
-        pool.free(onlyChild);
+        rewrite(mtr, rootPage, child.isLeaf() ? PageType.LEAF : PageType.INTERNAL, child.aux(), cells(child));
+        mtr.free(onlyChild);
     }
 
     // ---- descent ----
@@ -340,81 +369,69 @@ public final class BTree {
      * page overflowed: cells (in order) are what it should hold. Splits it by bytes and pushes the separator up the
      * path, splitting parents as needed. page is latched exclusively by the caller.
      */
-    void split(PageGuard page, boolean leaf, List<byte[]> cells, Path path) {
+    void split(Mtr mtr, PageGuard page, boolean leaf, List<byte[]> cells, Path path) {
         if (page.pageId() == root) {
-            splitRoot(page, leaf, cells);
+            splitRoot(mtr, page, leaf, cells);
             return;
         }
         Node node = Node.of(page.buffer());
         byte[] separator;
         int rightId;
-        try (PageGuard right = pool.newPage()) {
-            right.latchExclusive();
+        try (PageGuard right = mtr.allocate()) {
             rightId = right.pageId();
             if (leaf) {
                 int cut = leafCut(cells);
-                Node.rewrite(right.buffer(), rightId, PageType.LEAF, node.aux(), cells.subList(cut, cells.size()));
-                Node.rewrite(page.buffer(), page.pageId(), PageType.LEAF, rightId, cells.subList(0, cut));
+                rewrite(mtr, right, PageType.LEAF, node.aux(), cells.subList(cut, cells.size()));
+                rewrite(mtr, page, PageType.LEAF, rightId, cells.subList(0, cut));
                 separator = Node.cellKey(cells.get(cut));
             } else {
                 int middle = internalCut(cells);
                 byte[] up = cells.get(middle);
-                Node.rewrite(right.buffer(), rightId, PageType.INTERNAL, Node.cellChild(up),
-                        cells.subList(middle + 1, cells.size()));
-                Node.rewrite(page.buffer(), page.pageId(), PageType.INTERNAL, node.aux(), cells.subList(0, middle));
+                rewrite(mtr, right, PageType.INTERNAL, Node.cellChild(up), cells.subList(middle + 1, cells.size()));
+                rewrite(mtr, page, PageType.INTERNAL, node.aux(), cells.subList(0, middle));
                 separator = Node.cellKey(up);
             }
-            right.markDirty();
-            page.markDirty();
         }
-        page.close();
-        insertIntoParent(path, separator, rightId);
+        page.close(); // the mini-transaction keeps it latched until commit
+        insertIntoParent(mtr, path, separator, rightId);
     }
 
     /** Adds separator → child just after the position the path took in the last parent on it. */
-    void insertIntoParent(Path path, byte[] separator, int child) {
+    void insertIntoParent(Mtr mtr, Path path, byte[] separator, int child) {
         int parentId = path.lastPage();
         int at = path.lastPosition() + 1;
         path.pop();
-        try (PageGuard parent = pool.fetch(parentId)) {
-            parent.latchExclusive();
+        try (PageGuard parent = mtr.fetchExclusive(parentId)) {
             Node node = Node.of(parent.buffer());
             byte[] cell = Node.internalCell(separator, child);
-            parent.markDirty();
-            if (node.page().insert(at, cell)) {
+            if (mtr.insert(parent, at, cell)) {
                 return;
             }
             List<byte[]> cells = cells(node);
             cells.add(at, cell);
-            split(parent, false, cells, path);
+            split(mtr, parent, false, cells, path);
         }
     }
 
     // The root keeps its page id: its two halves move to new pages and it becomes their parent.
-    private void splitRoot(PageGuard rootPage, boolean leaf, List<byte[]> cells) {
+    private void splitRoot(Mtr mtr, PageGuard rootPage, boolean leaf, List<byte[]> cells) {
         Node node = Node.of(rootPage.buffer());
-        try (PageGuard left = pool.newPage(); PageGuard right = pool.newPage()) {
-            left.latchExclusive();
-            right.latchExclusive();
+        try (PageGuard left = mtr.allocate(); PageGuard right = mtr.allocate()) {
             byte[] separator;
             if (leaf) {
                 int cut = leafCut(cells);
-                Node.rewrite(left.buffer(), left.pageId(), PageType.LEAF, right.pageId(), cells.subList(0, cut));
-                Node.rewrite(right.buffer(), right.pageId(), PageType.LEAF, 0, cells.subList(cut, cells.size()));
+                rewrite(mtr, left, PageType.LEAF, right.pageId(), cells.subList(0, cut));
+                rewrite(mtr, right, PageType.LEAF, 0, cells.subList(cut, cells.size()));
                 separator = Node.cellKey(cells.get(cut));
             } else {
                 int middle = internalCut(cells);
                 byte[] up = cells.get(middle);
-                Node.rewrite(left.buffer(), left.pageId(), PageType.INTERNAL, node.aux(), cells.subList(0, middle));
-                Node.rewrite(right.buffer(), right.pageId(), PageType.INTERNAL, Node.cellChild(up),
-                        cells.subList(middle + 1, cells.size()));
+                rewrite(mtr, left, PageType.INTERNAL, node.aux(), cells.subList(0, middle));
+                rewrite(mtr, right, PageType.INTERNAL, Node.cellChild(up), cells.subList(middle + 1, cells.size()));
                 separator = Node.cellKey(up);
             }
-            Node.rewrite(rootPage.buffer(), root, PageType.INTERNAL, left.pageId(),
+            rewrite(mtr, rootPage, PageType.INTERNAL, left.pageId(),
                     List.of(Node.internalCell(separator, right.pageId())));
-            left.markDirty();
-            right.markDirty();
-            rootPage.markDirty();
         }
     }
 
@@ -479,5 +496,9 @@ public final class BTree {
 
     BufferPool pool() {
         return pool;
+    }
+
+    PageStore store() {
+        return store;
     }
 }

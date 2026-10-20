@@ -29,16 +29,19 @@ public final class Index {
         return tree.get(Objects.requireNonNull(key, "key"));
     }
 
-    /** Stores value under key, replacing any value already there. */
+    /** Stores value under key, replacing any value already there. Atomic; durable on return with SYNC. */
     public void put(byte[] key, byte[] value) {
         db.checkOpen();
         tree.put(Objects.requireNonNull(key, "key"), Objects.requireNonNull(value, "value"));
+        db.afterWrite();
     }
 
     /** Removes key. Returns false if it wasn't there. */
     public boolean delete(byte[] key) {
         db.checkOpen();
-        return tree.delete(Objects.requireNonNull(key, "key"));
+        boolean found = tree.delete(Objects.requireNonNull(key, "key"));
+        db.afterWrite();
+        return found;
     }
 
     /** The entries in [from, to) in key order; a null bound means unbounded. Close the cursor when done. */

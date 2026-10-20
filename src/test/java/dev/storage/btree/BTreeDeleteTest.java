@@ -8,9 +8,9 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import dev.storage.buffer.BufferPool;
 import dev.storage.buffer.ClockReplacer;
-import dev.storage.file.PageFile;
+import dev.storage.wal.Durability;
+import dev.storage.wal.PageStore;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -28,23 +28,21 @@ class BTreeDeleteTest {
     @TempDir
     Path dir;
 
-    private PageFile file;
-    private BufferPool pool;
+    private PageStore store;
 
     @BeforeEach
     void open() {
-        file = PageFile.create(dir.resolve("db"), PAGE);
-        pool = new BufferPool(file, 32, new ClockReplacer(32));
+        store = PageStore.open(dir.resolve("db"), new PageStore.Config(PAGE, 32, ClockReplacer::new, Durability.ASYNC,
+                Long.MAX_VALUE));
     }
 
     @AfterEach
     void close() {
-        pool.close();
-        file.close();
+        store.close();
     }
 
     private BTree filled(int n, int valueSize) {
-        BTree tree = BTree.create(pool, PAGE);
+        BTree tree = BTree.create(store);
         for (long k = 0; k < n; k++) {
             tree.put(key(k), value(k, valueSize));
         }
@@ -98,14 +96,14 @@ class BTreeDeleteTest {
     @Test
     void freedPagesAreReusedSoTheFileDoesNotGrowOnRefill() {
         BTree tree = filled(1_000, 300);
-        int pages = file.pageCount();
+        int pages = store.pageCount();
         for (long k = 0; k < 1_000; k++) {
             tree.delete(key(k));
         }
         for (long k = 0; k < 1_000; k++) {
             tree.put(key(k), value(k, 300));
         }
-        assertTrue(file.pageCount() <= pages + 2, "file grew from " + pages + " to " + file.pageCount() + " pages");
+        assertTrue(store.pageCount() <= pages + 2, "file grew from " + pages + " to " + store.pageCount() + " pages");
         for (long k = 0; k < 1_000; k++) {
             assertArrayEquals(value(k, 300), tree.get(key(k)));
         }
@@ -115,7 +113,7 @@ class BTreeDeleteTest {
     void variableLengthKeysSurviveMergesAndSeparatorChanges() {
         // Keys from 1 to 400 bytes: replacement separators are often longer than the ones they replace, which is the
         // path where a delete splits a parent.
-        BTree tree = BTree.create(pool, PAGE);
+        BTree tree = BTree.create(store);
         var random = new Random(21);
         List<byte[]> keys = new ArrayList<>();
         for (int n = 0; n < 1_500; n++) {

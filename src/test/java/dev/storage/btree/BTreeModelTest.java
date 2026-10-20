@@ -4,10 +4,11 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import dev.storage.buffer.BufferPool;
 import dev.storage.buffer.ClockReplacer;
 import dev.storage.buffer.LruReplacer;
 import dev.storage.file.PageFile;
+import dev.storage.wal.Durability;
+import dev.storage.wal.PageStore;
 import dev.storage.key.KeyEncoder;
 import dev.storage.page.PageHeader;
 import dev.storage.page.PageType;
@@ -32,7 +33,7 @@ import org.junit.jupiter.api.io.TempDir;
 class BTreeModelTest {
 
     private static final int PAGE = 4096;
-    private static final int FRAMES = 12;
+    private static final int FRAMES = 24; // a merge holds about three pages per level until it commits
     private static final int KEY_SPACE = 1_500;
     private static final int OPS = 4_000;
 
@@ -65,10 +66,8 @@ class BTreeModelTest {
         NavigableMap<byte[], byte[]> model = new TreeMap<>(Arrays::compareUnsigned);
         int root;
         int maxEntry = BTree.maxEntrySize(PAGE);
-        try (PageFile file = PageFile.create(path, PAGE);
-                BufferPool pool = new BufferPool(file, FRAMES, clock ? new ClockReplacer(FRAMES)
-                        : new LruReplacer(FRAMES))) {
-            BTree tree = BTree.create(pool, PAGE);
+        try (PageStore store = PageStore.open(path, config(clock))) {
+            BTree tree = BTree.create(store);
             root = tree.rootPage();
             int maxHeight = 0;
             for (int op = 0; op < OPS; op++) {
@@ -101,7 +100,7 @@ class BTreeModelTest {
                 assertEquals(root, tree.rootPage());
             }
             assertTrue(maxHeight >= 4, "max height " + maxHeight);
-            assertNoPageLost(file, pool, tree);
+            assertNoPageLost(path, store, tree);
 
             // Empty it: everything but the root goes back to the free list.
             for (byte[] k : new ArrayList<>(model.keySet())) {
@@ -110,7 +109,7 @@ class BTreeModelTest {
                 check(tree, "drain", -1);
             }
             assertEquals(new TreeChecker.Result(0, 1, 1), TreeChecker.check(tree));
-            assertNoPageLost(file, pool, tree);
+            assertNoPageLost(path, store, tree);
 
             // Refill a little for the reopen check below.
             for (int id = 0; id < 400; id++) {
@@ -121,9 +120,8 @@ class BTreeModelTest {
             }
         }
 
-        try (PageFile file = PageFile.open(path); BufferPool pool = new BufferPool(file, FRAMES,
-                new LruReplacer(FRAMES))) {
-            BTree tree = BTree.open(pool, root, PAGE);
+        try (PageStore store = PageStore.open(path, config(false))) {
+            BTree tree = BTree.open(store, root);
             assertEquals(model.size(), TreeChecker.check(tree).keys());
             assertScan(tree, model, null, null, "after reopen");
         }
@@ -163,19 +161,27 @@ class BTreeModelTest {
     }
 
     // Every page but the meta page is either in the tree or free. Catches merges and collapses that drop a page.
-    private static void assertNoPageLost(PageFile file, BufferPool pool, BTree tree) {
-        pool.flushAll();
+    private static PageStore.Config config(boolean clock) {
+        return new PageStore.Config(PAGE, FRAMES, clock ? ClockReplacer::new : LruReplacer::new, Durability.ASYNC,
+                Long.MAX_VALUE);
+    }
+
+    // After a checkpoint, read straight from the file.
+    private static void assertNoPageLost(Path path, PageStore store, BTree tree) {
+        store.checkpoint();
         int inTree = TreeChecker.check(tree).pages();
         int free = 0;
-        ByteBuffer page = ByteBuffer.allocate(PAGE);
-        for (int id = 1; id < file.pageCount(); id++) {
-            page.clear();
-            file.read(id, page);
-            if (PageHeader.type(page) == PageType.FREE) {
-                free++;
+        try (PageFile file = PageFile.open(path)) {
+            ByteBuffer page = ByteBuffer.allocate(PAGE);
+            for (int id = 1; id < file.pageCount(); id++) {
+                page.clear();
+                file.read(id, page);
+                if (PageHeader.type(page) == PageType.FREE) {
+                    free++;
+                }
             }
+            assertEquals(file.pageCount() - 1, inTree + free, "pages lost: " + inTree + " in the tree, " + free
+                    + " free, " + file.pageCount() + " in the file");
         }
-        assertEquals(file.pageCount() - 1, inTree + free, "pages lost: " + inTree + " in the tree, " + free
-                + " free, " + file.pageCount() + " in the file");
     }
 }

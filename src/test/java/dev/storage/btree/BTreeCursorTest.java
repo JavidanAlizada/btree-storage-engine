@@ -8,12 +8,12 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import dev.storage.buffer.BufferPool;
 import dev.storage.buffer.ClockReplacer;
-import dev.storage.file.PageFile;
 import dev.storage.key.KeyDecoder;
 import dev.storage.key.KeyEncoder;
 import dev.storage.key.Keys;
+import dev.storage.wal.Durability;
+import dev.storage.wal.PageStore;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -30,24 +30,22 @@ class BTreeCursorTest {
     @TempDir
     Path dir;
 
-    private PageFile file;
-    private BufferPool pool;
+    private PageStore store;
 
     @BeforeEach
     void open() {
-        file = PageFile.create(dir.resolve("db"), PAGE);
-        pool = new BufferPool(file, 32, new ClockReplacer(32));
+        store = PageStore.open(dir.resolve("db"), new PageStore.Config(PAGE, 32, ClockReplacer::new, Durability.ASYNC,
+                Long.MAX_VALUE));
     }
 
     @AfterEach
     void close() {
-        pool.close();
-        file.close();
+        store.close();
     }
 
     // Keys 0, 2, 4, ... so bounds can fall between keys.
     private BTree evenKeys(int count) {
-        BTree tree = BTree.create(pool, PAGE);
+        BTree tree = BTree.create(store);
         for (long n = 0; n < count; n++) {
             tree.put(key(2 * n), value(2 * n, 300));
         }
@@ -72,7 +70,7 @@ class BTreeCursorTest {
 
     @Test
     void anEmptyTreeScansNothing() {
-        BTree tree = BTree.create(pool, PAGE);
+        BTree tree = BTree.create(store);
         assertEquals(List.of(), scan(tree, null, null));
     }
 
@@ -103,7 +101,7 @@ class BTreeCursorTest {
 
     @Test
     void aPrefixScanFindsEveryKeyOfOneComposite() {
-        BTree tree = BTree.create(pool, PAGE);
+        BTree tree = BTree.create(store);
         for (String region : List.of("as", "eu", "us")) {
             for (long id = 0; id < 400; id++) {
                 tree.put(KeyEncoder.create().addString(region).addLong(id).encode(), value(id, 200));

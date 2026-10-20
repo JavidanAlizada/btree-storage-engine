@@ -234,6 +234,16 @@ public final class PageStore implements AutoCloseable {
         }
     }
 
+    /** Pages in the file, counting the meta page and free pages. */
+    public int pageCount() {
+        allocator.lock.lock();
+        try {
+            return allocator.pageCount;
+        } finally {
+            allocator.lock.unlock();
+        }
+    }
+
     /** Bytes in the log since the last checkpoint. */
     public long logSize() {
         return wal.size();

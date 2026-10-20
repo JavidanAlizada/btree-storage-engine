@@ -161,9 +161,12 @@ class DatabaseTest {
     @Test
     void optionsAreValidated() {
         var clock = Options.ReplacerPolicy.CLOCK;
-        assertThrows(IllegalArgumentException.class, () -> new Options(5000, 1_024, clock));
-        assertThrows(IllegalArgumentException.class, () -> new Options(8192, 2, clock));
-        assertThrows(IllegalArgumentException.class, () -> new Options(8192, 1_024, null));
-        assertEquals(new Options(4096, 16, clock), SMALL);
+        var sync = Options.Durability.SYNC;
+        assertThrows(IllegalArgumentException.class, () -> new Options(5000, 1_024, clock, sync, 1));
+        assertThrows(IllegalArgumentException.class, () -> new Options(8192, 15, clock, sync, 1));
+        assertThrows(IllegalArgumentException.class, () -> new Options(8192, 1_024, null, sync, 1));
+        assertThrows(IllegalArgumentException.class, () -> new Options(8192, 1_024, clock, null, 1));
+        assertThrows(IllegalArgumentException.class, () -> new Options(8192, 1_024, clock, sync, 0));
+        assertEquals(new Options(4096, 16, clock, sync, 64L << 20), SMALL);
     }
 }

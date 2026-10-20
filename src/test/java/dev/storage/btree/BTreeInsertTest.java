@@ -6,11 +6,11 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import dev.storage.buffer.BufferPool;
 import dev.storage.buffer.LruReplacer;
-import dev.storage.file.PageFile;
 import dev.storage.key.KeyEncoder;
 import java.nio.charset.StandardCharsets;
+import dev.storage.wal.Durability;
+import dev.storage.wal.PageStore;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -28,19 +28,17 @@ class BTreeInsertTest {
     @TempDir
     Path dir;
 
-    private PageFile file;
-    private BufferPool pool;
+    private PageStore store;
 
     @BeforeEach
     void open() {
-        file = PageFile.create(dir.resolve("db"), PAGE);
-        pool = new BufferPool(file, 32, new LruReplacer(32));
+        store = PageStore.open(dir.resolve("db"), new PageStore.Config(PAGE, 32, LruReplacer::new, Durability.ASYNC,
+                Long.MAX_VALUE));
     }
 
     @AfterEach
     void close() {
-        pool.close();
-        file.close();
+        store.close();
     }
 
     static byte[] key(long n) {
@@ -56,14 +54,14 @@ class BTreeInsertTest {
 
     @Test
     void anEmptyTreeHasNoKeys() {
-        BTree tree = BTree.create(pool, PAGE);
+        BTree tree = BTree.create(store);
         assertNull(tree.get(key(1)));
         assertEquals(new TreeChecker.Result(0, 1, 1), TreeChecker.check(tree));
     }
 
     @Test
     void ascendingInsertsSplitAllTheWayUpAndKeepTheRoot() {
-        BTree tree = BTree.create(pool, PAGE);
+        BTree tree = BTree.create(store);
         int root = tree.rootPage();
         for (long n = 0; n < 5_000; n++) {
             tree.put(key(n), value(n, 300)); // about 6 a leaf after half-full splits: ~800 leaves, so 3 levels
@@ -80,7 +78,7 @@ class BTreeInsertTest {
 
     @Test
     void randomInsertsWithLargeValuesStayBalanced() {
-        BTree tree = BTree.create(pool, PAGE);
+        BTree tree = BTree.create(store);
         List<Long> order = new ArrayList<>();
         for (long n = 0; n < 2_000; n++) {
             order.add(n);
@@ -97,7 +95,7 @@ class BTreeInsertTest {
 
     @Test
     void putReplacesAndALargerReplacementCanSplit() {
-        BTree tree = BTree.create(pool, PAGE);
+        BTree tree = BTree.create(store);
         for (long n = 0; n < 12; n++) {
             tree.put(key(n), value(n, 100));
         }
@@ -110,7 +108,7 @@ class BTreeInsertTest {
 
     @Test
     void maximumSizeKeysAndEntriesWork() {
-        BTree tree = BTree.create(pool, PAGE);
+        BTree tree = BTree.create(store);
         int maxKey = BTree.maxKeySize(PAGE);
         int maxEntry = BTree.maxEntrySize(PAGE);
         var random = new Random(9);
@@ -126,7 +124,7 @@ class BTreeInsertTest {
 
     @Test
     void emptyKeysAndValuesAreOrdinaryEntries() {
-        BTree tree = BTree.create(pool, PAGE);
+        BTree tree = BTree.create(store);
         tree.put(new byte[0], new byte[0]);
         tree.put(new byte[] {0}, new byte[] {1});
         assertArrayEquals(new byte[0], tree.get(new byte[0]));
