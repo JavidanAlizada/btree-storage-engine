@@ -16,8 +16,8 @@ latch coupling) and to write the reasoning down next to the code.
 | M1 | Pages and the page file | **Done (0.1.0)** |
 | M2 | Buffer pool: frames, pin/unpin, LRU and Clock | **Done (0.2.0)** |
 | M3 | B+Tree: split, merge, range scans, composite keys | **Done (0.3.0)** |
-| M4 | Write-ahead log and crash recovery | Next |
-| M5 | Concurrent B+Tree (latch crabbing) | Planned |
+| M4 | Write-ahead log and crash recovery | **Done (0.4.0)** |
+| M5 | Concurrent B+Tree (latch crabbing) | Next |
 | M6 | Benchmarks (JMH), demo, close-out | Planned |
 
 ```java
@@ -34,11 +34,14 @@ try (Database db = Database.open(Path.of("data.db"), Options.defaults())) {
 }
 ```
 
-**Not crash-safe yet.** Changes reach the file when pages are evicted, at
-`checkpoint()` and at `close()`, in no particular order. A crash in between
-can leave a tree half split, or leak pages. Opening a file after a crash
-isn't safe until the write-ahead log in M4. Writers are serialized per
-index (one lock per tree) until latch crabbing in M5.
+**Crash-safe.** Every `put`, `delete` and `createIndex` is atomic, and
+with `Durability.SYNC` (the default) it's on disk when the call returns.
+After a crash, `Database.open` recovers from the write-ahead log
+(`data.db-wal`): everything acknowledged is there, and a change in flight
+is there completely or not at all. `Durability.ASYNC` returns before the
+fsync, so a power loss can lose the latest changes, but only a suffix of
+them, never half of one. Writers are serialized per index (one lock per
+tree) until latch crabbing in M5.
 
 ## Build and test
 
@@ -63,8 +66,8 @@ Integers are big-endian.
 
 * **crc32c** covers everything after itself. It's stamped when a page is
   written to disk and checked when it's read back, never in between.
-* **pageLSN** is reserved for the write-ahead log (M4), so the format won't
-  have to change when recovery arrives.
+* **pageLSN** is the log position of the last change to the page (see
+  the write-ahead log below).
 * **pageId** is the page's own number. A page that checksums fine but sits
   at the wrong offset was written or read to the wrong place. That
   failure is real on some storage, and a checksum alone can't see it.
@@ -238,6 +241,70 @@ ids, and its own fixed root is stored in the meta page. `Database` keeps a
 single tree object per index, because the per-tree lock lives on that
 object.
 
+## The write-ahead log
+
+```java
+Options.defaults()
+       .withDurability(Options.Durability.SYNC)   // the default
+       .withCheckpointLogBytes(64L << 20);        // checkpoint every 64 MiB of log
+```
+
+**Redo-only, physiological.** A log record names a page and says what
+changed inside it as a slotted-page operation: insert this cell at slot
+k, delete slot k, set `aux`, or a whole page image. Redo calls the same
+`SlottedPage` code that made the change. That code depends only on the
+page's bytes, compaction included, so replaying a page's records rebuilds
+it byte for byte. Test builds check that on every commit: each commit
+replays its own records and compares the result with the page in memory.
+
+**Mini-transactions.** A split touches three or more pages. All of a
+change's records go to the log as one group, framed by a length, a
+CRC32C and the group's start LSN. Recovery redoes whole groups or
+nothing, so there's no undo pass. Pages a mini-transaction changes stay
+latched until it commits. That way no eviction can write a page whose
+log record doesn't exist yet. If anything fails part-way through, the
+store stops for good (fail-stop): the pages in memory are then ahead of
+the log, so nothing more is written, and reopening recovers.
+
+**The WAL rule.** The buffer pool calls the log before it writes a page
+back: the log must be on disk up to the page's LSN first. **Group
+commit**: the first thread that needs a flush runs the fsync for
+everyone who has appended so far. Threads that arrive while it runs wait
+for it, then check again.
+
+**Torn pages.** The first change to a page after a checkpoint logs a
+full image of it, without the unused gap between slots and cells.
+Recovery overwrites the page with that image and never reads the copy on
+disk, so a page torn by a crash is rebuilt. A page whose deltas would
+take more room than its image also gets the image; that covers splits
+and merges, which rewrite whole pages.
+
+**Allocation is logged too.** The page count, the free-list head and the
+catalog root change only inside a mini-transaction, which logs them. The
+meta page is written only by checkpoints. A crash can't leave a freed page
+in the free list while its parent still points at it.
+
+**Checkpoints** are sharp: they wait for running changes and hold new
+ones back, flush the log, write every dirty page, force them, then write
+the meta page (with the log position it covers) and force again. Then
+they empty the log. They run on `checkpoint()`, `close()`, at the end of
+recovery, and on their own once the log passes `checkpointLogBytes`.
+
+**Recovery** starts from the meta page, the last checkpoint. It forces
+the log, then redoes every group after the checkpoint, in order. The log
+ends at the first group whose CRC or start LSN doesn't match. That tail
+is zeroed, so stale groups past a torn one can't come back after new
+appends. Then it checkpoints, and the log is empty again.
+
+**Files.** The log grows in preallocated 4 MiB chunks, each forced with
+its size once, so appends inside a chunk only need `force(false)`. A new
+database is built as `<name>.creating`, then renamed into place, so a
+crash during creation leaves nothing half made. Two assumptions,
+documented rather than worked around: a 512-byte sector write is atomic
+(the log header and the meta page's fields each fit in one, as with
+PostgreSQL's `pg_control`). And on macOS, `force` is `fsync`, not
+`F_FULLFSYNC`, so a drive's own cache can still lose data on power loss.
+
 ## Design decisions
 
 **`FileChannel`, not `mmap`.** The engine must decide when a dirty page
@@ -292,6 +359,26 @@ stateless. M6 measures what it costs; the upper levels are usually pool hits.
 **A tree lock for now.** M3 lets many readers or one writer into a tree.
 It's the simplest scheme that's correct, and the tree code doesn't need
 it to change: page latches are already taken as M5's crabbing will need.
+A writer starts its mini-transaction before it takes the tree lock. The
+other order deadlocks as soon as a checkpoint is waiting.
+
+**Physiological redo, not ARIES and not page images.** Full ARIES
+(redo, undo and compensation records) is what real transactions need, and
+that's Project 08's job. Logging a page image on every change is
+simpler, but it writes about a page of log per `put`. Logical records
+("insert k into tree t") are smallest, but redoing them means redoing
+splits on a tree that may not be consistent yet.
+
+**Sharp checkpoints, not fuzzy ones.** A fuzzy checkpoint (begin/end
+records, a dirty page table, a background writer) doesn't stop writers.
+A sharp one is much simpler to get right. It's the brief's Phase 1
+choice; fuzzy checkpoints are Phase 2.
+
+**One log file, reset at each checkpoint.** PostgreSQL recycles 16 MiB
+segment files, which turns truncation into a file delete. With the log
+emptied at every checkpoint, one file is enough. LSNs keep growing
+across resets (the new base is the old end), and each group carries its
+start LSN, so old bytes can't pass as new groups.
 
 **Big-endian, fixed-width fields.** These are the `ByteBuffer` defaults.
 Byte order on disk matters only for portability, and a fixed width keeps
@@ -309,7 +396,7 @@ every field at a fixed offset.
 * Corruption tests: a flipped byte, a zeroed page, a misdirected page, a
   truncated file, a wrong magic or version, and a broken free-list link.
 * Fault injection through a `FileChannel` wrapper that fails fsync or
-  flips a byte on write. M4 adds crashes and torn writes to it.
+  flips a byte on write.
 * A golden file: a fixed sequence of operations must produce the committed
   bytes exactly, and those bytes must still open. A failure means the
   on-disk format changed, which needs a new format version.
@@ -334,7 +421,7 @@ every field at a fixed offset.
   refill; and range scans with every kind of bound.
 * A model test against `TreeMap`: per seed, 4,000 random puts, deletes,
   gets and scans with variable-size keys and values, on 4 KiB pages and a
-  12-frame pool. The tree grows to height 4 or more and shrinks back. After
+  24-frame pool. The tree grows to height 4 or more and shrinks back. After
   every operation, a checker walks the whole tree: sorted cells, keys inside
   their separators, all leaves at one depth, the leaf chain, every non-root
   node at least a quarter full, no page reachable twice. It also checks
@@ -344,8 +431,38 @@ every field at a fixed offset.
   split, cursors that hold no pins (100 open on a 32-frame pool), and
   writes between cursor calls.
 
-No mutation testing. That's a scope decision; the model and fault tests
-cover the bugs that matter here.
+* Log tests: groups round-trip with byte LSNs, groups larger than a chunk,
+  a torn tail (zeroed, so a valid group after it doesn't come back), stale
+  bytes under a new header, a damaged header, and 8 threads committing at
+  once with fewer fsyncs than commits.
+* Mini-transaction tests: 3,000 random slot changes replayed from the log
+  onto blank pages give the same bytes; an image, then deltas; free-list
+  reuse; an uncommitted change fails the store; eviction forces the log
+  first.
+* Recovery tests: redo after a crash with a checkpoint in the middle, the
+  free list and page count recovered, a torn page rebuilt from its image,
+  an automatic checkpoint, a missing log after a clean close, and a log
+  that starts after the checkpoint rejected.
+* **Crash tests.** A `FileChannel` that models the OS page cache in
+  512-byte sectors. Writes stay in memory until `force`. At a power cut,
+  each unforced sector reaches the disk or not, at random, which also
+  tears pages. A random workload through `Database` (index creations,
+  puts, deletes, checkpoints) is crashed at every write and fsync it
+  reaches, then recovered on the real files. With SYNC the result must
+  equal the model after every acknowledged operation, plus the in-flight
+  one either wholly or not at all. With ASYNC it must be a prefix of the
+  operations. Every tree must pass the invariant checker, and every page
+  must be in a tree or free. One crash in seven also crashes recovery,
+  and recovers again. One workload is sized to evict dirty pages between
+  checkpoints, because otherwise the WAL rule is never exercised.
+* The crash tests found a real bug from M1: `PageFile.sync()` wrote the
+  meta page in the same unforced batch as the pages it counts, so a crash
+  could leave a file shorter than its meta page says. Each of these
+  breaks makes the crash tests fail: removing the WAL rule on eviction,
+  logging no page images after a checkpoint, or reverting that fix.
+
+No mutation testing tool. That's a scope decision. The mutations above
+were done by hand, to show the tests catch what they're meant to.
 
 ## CI
 
@@ -356,8 +473,10 @@ review.
 
 ## Security
 
-The input surface is the database file. Pages are untrusted on read: the
-checksum first, then every offset and length is bounds-checked before use.
+The input surface is the database file and its log. Pages are untrusted
+on read: the checksum first, then every offset and length is
+bounds-checked before use. Log groups are checked by CRC, start LSN and
+length before they're decoded.
 There's no Java deserialization anywhere. The file is not encrypted, and
 access control is the file system's. Zero runtime dependencies.
 
@@ -366,7 +485,10 @@ access control is the file system's. Zero runtime dependencies.
 Nothing has been measured yet, so this README makes no performance claims.
 JMH benchmarks (point reads, inserts, range scans, LRU vs. Clock, durability
 modes, 1 to 16 threads, against `TreeMap`/`ConcurrentSkipListMap` baselines)
-are planned for M6, with the machine and JDK they ran on.
+are planned for M6, with the machine and JDK they ran on. Known cost
+until then: with SYNC, one index's writers each wait for their own fsync,
+because the commit flushes under the tree lock. Writers on different
+indexes share fsyncs.
 
 ## Containers
 

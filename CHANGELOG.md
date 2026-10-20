@@ -6,6 +6,47 @@ per milestone, not per commit.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-10-20
+
+### Milestone 4 — Write-ahead log and crash recovery
+
+- `dev.storage.wal.Wal`: one log file with a sector-sized header (base
+  LSN). Groups are framed by length, CRC32C and start LSN; an LSN is a
+  byte position. The file is preallocated in 4 MiB chunks so appends need
+  only `force(false)`. Group commit: one fsync covers every waiting
+  thread. Torn and stale tails are detected and zeroed.
+- `LogRecord`: physiological records META, IMAGE (without the free gap),
+  INSERT, DELETE and SET_AUX. Redo runs the same `SlottedPage` code.
+- `Mtr` (mini-transaction): a change's records go out as one group. Its
+  pages stay latched until commit. A page's first change after a
+  checkpoint logs a full image (torn-page repair). An uncommitted change
+  fails the store for good. A test-only redo check replays every commit
+  and compares the bytes.
+- Logged page allocation: the page count, free-list head and catalog root
+  are logged, and the meta page is written only at checkpoints.
+- `PageStore`: the page file, buffer pool, log and allocator. Sharp
+  checkpoints, automatic once the log passes `checkpointLogBytes`. Redo
+  recovery on open from the last checkpoint, idempotent by page LSN,
+  forcing the log before any redo.
+- `BufferPool`: a `LogFlusher` hook enforces the WAL rule on every
+  write-back; `pinBlank`; `fail` stops all write-back.
+- B+Tree: every change goes through a mini-transaction. `createIndex`
+  commits the new root and its catalog entry together.
+- `Options`: `Durability.SYNC` (default) / `ASYNC`, and
+  `checkpointLogBytes`. The minimum pool is now 16 frames.
+- New databases are created atomically (temporary name, then rename).
+- Fixed: `PageFile.sync()` wrote the meta page together with the data
+  pages it counts. It now forces the data first, so a crash can't leave
+  the meta page counting pages that never reached the file.
+- Tests: log, mini-transaction and recovery tests, plus crash tests on a
+  page-cache-modelling `FileChannel`. Those crash at every write and
+  fsync, tear pages at sector boundaries, crash recovery itself, and check
+  SYNC/ASYNC durability, atomicity, tree invariants and lost pages.
+  Hand mutations (no WAL rule, no page images, the old sync order) are
+  all caught.
+- Not yet: concurrent writers in one tree (M5), fuzzy checkpoints and
+  log archiving (Phase 2), no performance claims before M6.
+
 ## [0.3.0] — 2026-10-20
 
 ### Milestone 3 — B+Tree
