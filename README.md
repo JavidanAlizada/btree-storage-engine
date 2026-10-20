@@ -15,20 +15,30 @@ latch coupling) and to write the reasoning down next to the code.
 |---|---|---|
 | M1 | Pages and the page file | **Done (0.1.0)** |
 | M2 | Buffer pool: frames, pin/unpin, LRU and Clock | **Done (0.2.0)** |
-| M3 | B+Tree: split, merge, range scans, composite keys | Next |
-| M4 | Write-ahead log and crash recovery | Planned |
+| M3 | B+Tree: split, merge, range scans, composite keys | **Done (0.3.0)** |
+| M4 | Write-ahead log and crash recovery | Next |
 | M5 | Concurrent B+Tree (latch crabbing) | Planned |
 | M6 | Benchmarks (JMH), demo, close-out | Planned |
 
-There is no key-value API yet. What exists today are the bottom two layers: a
-file of checksummed pages with the slotted-page format every tree node will
-use, and a buffer pool that caches those pages and decides when they go back
-to disk.
+```java
+try (Database db = Database.open(Path.of("data.db"), Options.defaults())) {
+    Index users = db.createIndex("users");
+    byte[] key = KeyEncoder.create().addString("eu").addLong(42).encode();
+    users.put(key, value);
+    users.get(key);
+    users.delete(key);
+    byte[] eu = KeyEncoder.create().addString("eu").encode();
+    try (Cursor c = users.scan(eu, Keys.prefixEnd(eu))) {   // every ("eu", *)
+        while (c.next()) { c.key(); c.value(); }
+    }
+}
+```
 
-**Not crash-safe yet.** A crash between growing the file (or changing the
-free list) and writing the meta page can leak a page or lose a free-list
-entry. Nothing is corrupted silently: a leaked tail is detected and
-reported at open. The write-ahead log in M4 makes allocation atomic.
+**Not crash-safe yet.** Changes reach the file when pages are evicted, at
+`checkpoint()` and at `close()`, in no particular order. A crash in between
+can leave a tree half split, or leak pages. Opening a file after a crash
+isn't safe until the write-ahead log in M4. Writers are serialized per
+index (one lock per tree) until latch crabbing in M5.
 
 ## Build and test
 
@@ -178,6 +188,56 @@ allocated once, so the pool's footprint is fixed and outside the heap the
 GC scans. The pool doesn't own the `PageFile`: closing the pool flushes
 it, and whoever opened the file closes it.
 
+## The B+Tree
+
+**Keys are bytes, compared unsigned.** Typed and composite keys go through
+`KeyEncoder`, which writes them so that byte order is the same as logical
+order. Integers are big-endian with the sign bit flipped. Strings and byte
+strings are escaped (`0x00` becomes `0x00 0xFF`) and end in `0x00 0x00`, so
+`"ab"` sorts before `"abc"`, and a later field can't affect how an earlier
+string compares. Null is a tag that sorts first. `Keys.prefixEnd(prefix)` is
+the exclusive upper bound of every key starting with `prefix`. Strings sort
+by code point, not by any locale's collation. Keys are unique; a secondary
+index appends the primary key to make them so.
+
+**Nodes are slotted pages.** A leaf cell is `keyLength · key · value`, and
+the page's `aux` word links to the right sibling. An internal cell is
+`keyLength · key · child`, and `aux` is the leftmost child. A cell is at
+most a quarter page, so key + value is at most 2,034 bytes on 8 KiB pages
+(1,010 on 4 KiB). Larger entries are rejected, since overflow pages are
+Phase 2.
+
+**The root never moves.** When the root splits, its two halves go to new
+pages and it becomes their parent. When an internal root is down to one
+child, it takes that child's contents and the child is freed. The catalog
+can then store a root id once, and M5's crabbing never sees the root
+pointer change. The cost is one extra page copy per root split or collapse.
+
+**Splits cut by bytes, not by count.** The cut is the one that makes the
+larger half as small as possible. A leaf's separator is the first key of the
+right half; in an internal node the middle cell moves up. A split can
+propagate up to the root.
+
+**Deletes rebalance under 40%.** An underfull node is merged with a sibling
+if both fit in one page. Otherwise the two are redistributed, and the
+parent's separator is replaced. The new separator can be longer than the
+old one, so replacing it can split the parent, even during a delete. The
+fill floor that actually holds is a quarter page (a cut can leave a node at
+about 37.5%), and the invariant checker asserts that floor.
+
+**Cursors hold nothing between calls.** A cursor copies the rest of one
+leaf, and then finds the next leaf by descending from the root again, for
+the first key after the last one it returned. Inside that one call it may
+follow the sibling link, while it holds the tree's read lock. A slow
+consumer can't pin pages or block writers, and a leaf freed by a merge is
+never followed. The cost is one descent per leaf. It isn't a snapshot:
+an entry is read as it is when the cursor reaches its leaf.
+
+**The catalog is a B+Tree too.** It maps index names (UTF-8) to root page
+ids, and its own fixed root is stored in the meta page. `Database` keeps a
+single tree object per index, because the per-tree lock lives on that
+object.
+
 ## Design decisions
 
 **`FileChannel`, not `mmap`.** The engine must decide when a dirty page
@@ -212,6 +272,27 @@ M6's numbers point there.
 save an 8 KiB copy, but it would mean holding the latch across disk I/O, or
 stamping the checksum into a page that readers are looking at.
 
+**Byte keys and an order-preserving encoding, not comparators.** Typed
+comparators in the tree would be more flexible, but they'd put type
+dispatch in the innermost loop, and every page would need its schema.
+With byte keys, the tree only ever calls `ByteBuffer.mismatch`.
+
+**A fixed root, not a root pointer.** PostgreSQL keeps the root id in a
+metapage and updates it on every root split. A fixed root (as in InnoDB)
+costs one page copy per root split or collapse, about log n times over a
+tree's life. In exchange the catalog never changes, and there's no root
+pointer for concurrent readers to race.
+
+**Re-descending cursors, not sibling-walking ones.** Following the
+sibling link is one fetch per leaf instead of a descent. But the cursor
+would have to keep the leaf pinned between calls, or follow a link to a
+page that may have been freed meanwhile. Descending again keeps the cursor
+stateless. M6 measures what it costs; the upper levels are usually pool hits.
+
+**A tree lock for now.** M3 lets many readers or one writer into a tree.
+It's the simplest scheme that's correct, and the tree code doesn't need
+it to change: page latches are already taken as M5's crabbing will need.
+
 **Big-endian, fixed-width fields.** These are the `ByteBuffer` defaults.
 Byte order on disk matters only for portability, and a fixed width keeps
 every field at a fixed offset.
@@ -244,6 +325,24 @@ every field at a fixed offset.
   Breaking the eviction protocol on purpose makes it fail at once.
 * A corrupt page fetched by 8 threads at once: all of them get the error,
   and no pin is left behind.
+* Key encoding: the byte order of random encoded tuples matches a tuple
+  comparator, and every tuple decodes back to itself.
+* B+Tree cases: ascending and random inserts up to height 3 and more,
+  upserts that split, maximum-size and empty keys and values; deletes in
+  order, in reverse and at random down to a root leaf, with variable-length
+  keys so replacement separators are often longer; freed pages reused on
+  refill; and range scans with every kind of bound.
+* A model test against `TreeMap`: per seed, 4,000 random puts, deletes,
+  gets and scans with variable-size keys and values, on 4 KiB pages and a
+  12-frame pool. The tree grows to height 4 or more and shrinks back. After
+  every operation, a checker walks the whole tree: sorted cells, keys inside
+  their separators, all leaves at one depth, the leaf chain, every non-root
+  node at least a quarter full, no page reachable twice. It also checks
+  that no page is lost: every page is either in the tree or free. Breaking
+  merge or redistribute on purpose makes it fail at once.
+* Database tests: indexes and data survive reopen, a catalog big enough to
+  split, cursors that hold no pins (100 open on a 32-frame pool), and
+  writes between cursor calls.
 
 No mutation testing. That's a scope decision; the model and fault tests
 cover the bugs that matter here.

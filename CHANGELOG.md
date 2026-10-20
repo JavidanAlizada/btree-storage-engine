@@ -6,6 +6,32 @@ per milestone, not per commit.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-10-20
+
+### Milestone 3 — B+Tree
+
+- `dev.storage.key`: `KeyEncoder` / `KeyDecoder`, an order-preserving
+  encoding for null, int, long, string and bytes, and composite keys built
+  from them; `Keys.compare` and `Keys.prefixEnd`.
+- `dev.storage.btree.BTree`: unique byte keys in slotted-page leaves and
+  internal nodes. `get`, `put` (upsert), `delete` and `scan`. Splits
+  are byte-balanced and propagate to the root. Deletes merge or
+  redistribute under 40% full. The root page never moves (split and
+  collapse copy into it).
+- Range cursors over [from, to): they copy one leaf at a time and
+  re-descend for the next, holding no pins between calls. Not snapshots.
+- `dev.storage`: `Database` (open/create, `createIndex`, `index`,
+  `indexNames`, `checkpoint`, `close`), `Options`, `Index` and `Cursor`.
+  The catalog is a B+Tree rooted at the meta page's `catalogRoot`.
+- `PageFile.catalogRoot()` / `setCatalogRoot()`.
+- Concurrency: one read-write lock per tree; page latches as in M2.
+- Tests: key ordering and round trips, split/merge/redistribute/collapse
+  cases, cursors, a `TreeMap` model test with a full invariant check and a
+  lost-page check after every operation, and persistence through
+  `Database`.
+- Not yet: crash safety (M4), concurrent writers (M5), `dropIndex`,
+  overflow values, prefix compression and suffix truncation (Phase 2).
+
 ## [0.2.0] — 2026-10-15
 
 ### Milestone 2 — Buffer pool
