@@ -34,6 +34,8 @@ public final class BufferPool implements AutoCloseable {
     private final PageFile file;
     private final int pageSize;
     private final Replacer replacer;
+    private final LogFlusher flusher;
+    private volatile Throwable failure;
     private final Frame[] frames;
     private final ReentrantLock lock = new ReentrantLock();
     private final Map<Integer, Frame> table = new HashMap<>(); // guarded by lock
@@ -48,12 +50,18 @@ public final class BufferPool implements AutoCloseable {
     public record Stats(long hits, long misses, long evictions, long writeBacks) { }
 
     public BufferPool(PageFile file, int frameCount, Replacer replacer) {
+        this(file, frameCount, replacer, LogFlusher.NONE);
+    }
+
+    /** A pool that keeps the write-ahead rule: flusher runs before any page is written back. */
+    public BufferPool(PageFile file, int frameCount, Replacer replacer, LogFlusher flusher) {
         if (frameCount < 1) {
             throw new IllegalArgumentException("frameCount must be >= 1: " + frameCount);
         }
         this.file = file;
         this.pageSize = file.pageSize();
         this.replacer = replacer;
+        this.flusher = flusher;
         this.frames = new Frame[frameCount];
         int perArena = ARENA_BYTES / pageSize;
         ByteBuffer arena = null;
@@ -79,6 +87,27 @@ public final class BufferPool implements AutoCloseable {
             throw new IllegalArgumentException("page " + Integer.toUnsignedString(id) + " doesn't exist");
         }
         return pin(id, false);
+    }
+
+    /**
+     * Pins page id without reading it: if it isn't cached, its frame starts as a blank FREE page. For a caller about to
+     * overwrite the whole page, such as recovery restoring an image, where the copy on disk may be torn.
+     */
+    public PageGuard pinBlank(int id) {
+        if (id == 0 || Integer.compareUnsigned(id, file.pageCount()) >= 0) {
+            throw new IllegalArgumentException("page " + Integer.toUnsignedString(id) + " doesn't exist");
+        }
+        return pin(id, true);
+    }
+
+    /**
+     * Stops all write-back for good: pages changed in memory without a log record must never reach the file. Used
+     * when the layer above fails part-way through a change it can't undo.
+     */
+    public void fail(Throwable cause) {
+        if (failure == null) {
+            failure = cause;
+        }
     }
 
     /** Allocates a page in the file and pins it. It holds an empty FREE page until the caller formats it. */
@@ -164,9 +193,15 @@ public final class BufferPool implements AutoCloseable {
         return new Stats(hits.sum(), misses.sum(), evictions.sum(), writeBacks.sum());
     }
 
-    /** Flushes everything, then fails if any page is still pinned: a guard somewhere was never closed. */
+    /**
+     * Flushes everything, then fails if any page is still pinned: a guard somewhere was never closed. After fail(),
+     * writes nothing.
+     */
     @Override
     public void close() {
+        if (failure != null) {
+            return; // nothing in memory may be written
+        }
         flushAll();
         List<String> pinned = new ArrayList<>();
         lock.lock();
@@ -317,6 +352,10 @@ public final class BufferPool implements AutoCloseable {
             frame.latch.readLock().unlock();
         }
         try {
+            if (failure != null) {
+                throw new IllegalStateException("the pool stopped writing pages after a failure", failure);
+            }
+            flusher.flushTo(PageHeader.pageLsn(copy));
             file.write(frame.pageId, copy);
             writeBacks.increment();
         } catch (RuntimeException e) {

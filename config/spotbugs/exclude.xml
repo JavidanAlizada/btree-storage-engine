@@ -30,4 +30,40 @@
         <Class name="~.*Test"/>
         <Bug pattern="DMI_RANDOM_USED_ONLY_ONCE"/>
     </Match>
+    <!--
+      Log records are internal value objects built from bytes that are copied
+      already (a page image, a cloned cell, or a decoded group), and are never
+      changed after that. Copying the arrays again on every access would double
+      the cost of encoding and redo for nothing.
+    -->
+    <Match>
+        <Class name="~dev\.storage\.wal\.LogRecord\$.*"/>
+        <Or>
+            <Bug pattern="EI_EXPOSE_REP"/>
+            <Bug pattern="EI_EXPOSE_REP2"/>
+        </Or>
+    </Match>
+    <!--
+      The store hands out its buffer pool on purpose: the B+Tree reads pages
+      through it. A pool's failure cause is kept to report later, as is.
+    -->
+    <Match>
+        <Class name="dev.storage.wal.PageStore"/>
+        <Method name="pool"/>
+        <Bug pattern="EI_EXPOSE_REP"/>
+    </Match>
+    <Match>
+        <Class name="dev.storage.buffer.BufferPool"/>
+        <Field name="failure"/>
+        <Bug pattern="EI_EXPOSE_REP2"/>
+    </Match>
+    <!--
+      begin() takes the store's lock shared for the mini-transaction it returns,
+      and the mini-transaction releases it when it commits or closes.
+    -->
+    <Match>
+        <Class name="dev.storage.wal.PageStore"/>
+        <Method name="begin"/>
+        <Bug pattern="UL_UNRELEASED_LOCK"/>
+    </Match>
 </FindBugsFilter>

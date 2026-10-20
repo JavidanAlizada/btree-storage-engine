@@ -137,6 +137,69 @@ public final class PageFile implements AutoCloseable {
         }
     }
 
+    /**
+     * Raises the page count to count without writing anything: the new pages reach the file when they're first
+     * written. For an allocator that keeps the free list itself (the write-ahead log's); the meta page records the
+     * count at the next sync.
+     */
+    public void setPageCount(int count) {
+        checkUsable();
+        lock.lock();
+        try {
+            if (Integer.compareUnsigned(count, meta.pageCount) < 0) {
+                throw new IllegalArgumentException("page count can only grow: " + Integer.toUnsignedString(count));
+            }
+            meta.pageCount = count;
+            pageCount = count;
+            metaDirty = true;
+            grew = true;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public int freeListHead() {
+        lock.lock();
+        try {
+            return meta.freeListHead;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Records the free list's head for the next sync, for an allocator that keeps the list itself. */
+    public void setFreeListHead(int head) {
+        checkUsable();
+        lock.lock();
+        try {
+            meta.freeListHead = head;
+            metaDirty = true;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** The log position the last checkpoint covers: recovery redoes everything after it. */
+    public long checkpointLsn() {
+        lock.lock();
+        try {
+            return meta.checkpointLsn;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public void setCheckpointLsn(long lsn) {
+        checkUsable();
+        lock.lock();
+        try {
+            meta.checkpointLsn = lsn;
+            metaDirty = true;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /** Reads page id into dst (capacity = page size) and verifies its checksum and id. */
     public void read(int id, ByteBuffer dst) {
         checkUsable();
@@ -242,6 +305,11 @@ public final class PageFile implements AutoCloseable {
         } finally {
             lock.unlock();
         }
+    }
+
+    /** Closes without writing or syncing anything, for a caller whose in-memory state must not reach the file. */
+    public void abandon() {
+        closeQuietly(channel);
     }
 
     /** Syncs, then closes. Safe to call twice, and after a failure (it then only closes). */

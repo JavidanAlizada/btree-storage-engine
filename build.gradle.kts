@@ -31,6 +31,8 @@ dependencies {
 tasks.test {
     useJUnitPlatform()
     maxHeapSize = "1g"
+    // Every mini-transaction commit replays its own log group and checks it rebuilds the same page bytes.
+    systemProperty("dev.storage.redoCheck", "true")
 }
 
 jacoco {

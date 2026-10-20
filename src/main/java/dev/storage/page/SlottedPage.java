@@ -174,7 +174,8 @@ public final class SlottedPage {
         PageHeader.putU16(page, PageHeader.FRAGMENTED, 0);
     }
 
-    private int cellStart() {
+    /** Where the cell area starts: everything between the slot array and here is unused. */
+    public int cellStart() {
         int start = PageHeader.getU16(page, PageHeader.CELL_START);
         if (start < PageHeader.SIZE || start > pageSize) {
             throw corrupt("cellStart " + start + " is outside the page");
