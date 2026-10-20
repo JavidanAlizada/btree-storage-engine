@@ -317,6 +317,15 @@ public final class Wal implements AutoCloseable {
         }
     }
 
+    /** Closes without flushing, as a killed process would leave it: what was written stays in the OS's hands. */
+    void abandon() {
+        try {
+            channel.close();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
     private void checkUsable() {
         if (failure != null) {
             throw new StorageFailedException("an earlier log write or fsync failed; the log must be reopened", failure);

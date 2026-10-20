@@ -55,6 +55,19 @@ public final class PageFile implements AutoCloseable {
         return create(openChannel(path, StandardOpenOption.CREATE_NEW), pageSize);
     }
 
+    /** As create(path, pageSize), opening the file through opener. */
+    public static PageFile create(Path path, int pageSize, ChannelOpener opener) {
+        if (!PageHeader.isValidPageSize(pageSize)) {
+            throw new IllegalArgumentException("page size must be a power of two from " + PageHeader.MIN_PAGE_SIZE
+                    + " to " + PageHeader.MAX_PAGE_SIZE + ": " + pageSize);
+        }
+        try {
+            return create(opener.open(path, true), pageSize);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
     // The channel is a seam for tests that inject I/O faults.
     static PageFile create(FileChannel channel, int pageSize) {
         var file = new PageFile(channel, new MetaPage(pageSize, 1, 0, 0, 0));
@@ -75,6 +88,15 @@ public final class PageFile implements AutoCloseable {
     /** Opens an existing file, checking its format and meta page. */
     public static PageFile open(Path path) {
         return open(openChannel(path), path);
+    }
+
+    /** As open(path), opening the file through opener. */
+    public static PageFile open(Path path, ChannelOpener opener) {
+        try {
+            return open(opener.open(path, false), path);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     static PageFile open(FileChannel channel, Path path) {

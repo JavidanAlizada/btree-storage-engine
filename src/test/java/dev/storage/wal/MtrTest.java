@@ -44,7 +44,7 @@ class MtrTest {
 
     @BeforeEach
     void open() {
-        store = PageStore.create(dir.resolve("db"), config(16, Durability.ASYNC));
+        store = PageStore.open(dir.resolve("db"), config(16, Durability.ASYNC));
     }
 
     @AfterEach

@@ -1,14 +1,23 @@
 package dev.storage.wal;
 
 import dev.storage.buffer.BufferPool;
+import dev.storage.buffer.PageGuard;
 import dev.storage.buffer.Replacer;
+import dev.storage.file.ChannelOpener;
 import dev.storage.file.PageFile;
 import dev.storage.file.StorageFailedException;
+import dev.storage.file.StorageFormatException;
+import dev.storage.page.PageHeader;
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.nio.channels.FileChannel;
+import java.lang.System.Logger.Level;
+import java.nio.ByteBuffer;
+import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.IntFunction;
 
@@ -17,26 +26,32 @@ import java.util.function.IntFunction;
  * through a mini-transaction from begin(); the pool writes a page back only once the log holds it.
  *
  * Mini-transactions hold the store's lock shared, so a checkpoint, which takes it exclusively, sees no change half
- * made.
+ * made. Callers that also take their own locks (a tree's) take them after begin(), never before, or a checkpoint
+ * waiting for the store lock could deadlock them.
+ *
+ * Opening an existing store recovers it: the meta page is the last checkpoint, and every log group after it is
+ * redone, skipping pages whose LSN shows they already have it. Then it checkpoints, so the log starts empty.
  */
 public final class PageStore implements AutoCloseable {
+
+    private static final System.Logger LOG = System.getLogger(PageStore.class.getName());
 
     /** How a store is opened. replacer builds the pool's replacer for a frame count. */
     public record Config(int pageSize, int poolFrames, IntFunction<Replacer> replacer, Durability durability,
             long checkpointLogBytes) { }
 
     private final PageFile file;
-    private final Wal wal;
     private final BufferPool pool;
     private final PageAllocator allocator;
     private final Config config;
     private final ReentrantReadWriteLock changes = new ReentrantReadWriteLock();
+    private volatile Wal wal; // set once, right after the log is opened
     private volatile long redoStart;
     private volatile Throwable failure;
+    private volatile boolean closed;
 
-    private PageStore(PageFile file, Wal wal, Config config) {
+    private PageStore(PageFile file, Config config) {
         this.file = file;
-        this.wal = wal;
         this.config = config;
         this.pool = new BufferPool(file, config.poolFrames(), config.replacer().apply(config.poolFrames()),
                 this::flushTo);
@@ -44,16 +59,103 @@ public final class PageStore implements AutoCloseable {
         this.redoStart = file.checkpointLsn();
     }
 
-    /** A new store: a page file at path and its log at path + "-wal". Fails if either exists. */
-    public static PageStore create(Path path, Config config) {
-        PageFile file = PageFile.create(path, config.pageSize());
+    /** Opens the store at path (its log is path + "-wal"), recovering it if needed, or creates it. */
+    public static PageStore open(Path path, Config config) {
+        return open(path, config, ChannelOpener.DEFAULT);
+    }
+
+    /** Opens the store at path, recovering it if needed, or creates it if the page file doesn't exist. */
+    public static PageStore open(Path path, Config config, ChannelOpener opener) {
+        boolean exists = Files.exists(path);
+        PageFile file = exists ? PageFile.open(path, opener) : PageFile.create(path, config.pageSize(), opener);
+        PageStore store = null;
         try {
-            Wal wal = Wal.create(open(logPath(path), true), file.checkpointLsn());
-            return new PageStore(file, wal, config);
+            store = new PageStore(file, config);
+            Path logPath = logPath(path);
+            if (!exists) {
+                store.wal = Wal.create(opener.open(logPath, true), file.checkpointLsn());
+                return store;
+            }
+            long checkpoint = file.checkpointLsn();
+            if (!Files.exists(logPath)) {
+                // A clean store can lose its log safely; one with redo pending can't, but then nothing can be done.
+                LOG.log(Level.WARNING, "{0} has no log; starting a new one at LSN {1}", path, checkpoint);
+                store.wal = Wal.create(opener.open(logPath, true), checkpoint);
+                return store;
+            }
+            List<Wal.Group> groups = new ArrayList<>();
+            // Wal.open forces the log before it returns, so nothing redone below can reach the page file ahead of it.
+            Wal opened = Wal.open(opener.open(logPath, false), groups::add);
+            store.wal = opened;
+            if (opened.baseLsn() > checkpoint) {
+                throw new StorageFormatException("the log starts at LSN " + opened.baseLsn()
+                        + ", after the last checkpoint at " + checkpoint + ": log records are missing");
+            }
+            int redone = store.redo(groups, checkpoint);
+            if (redone > 0) {
+                LOG.log(Level.INFO, "{0}: recovered {1} log groups", path, redone);
+            }
+            store.checkpoint();
+            return store;
+        } catch (IOException e) {
+            closeAfterFailedOpen(store, file);
+            throw new UncheckedIOException(e);
         } catch (RuntimeException e) {
-            file.close();
+            closeAfterFailedOpen(store, file);
             throw e;
         }
+    }
+
+    private static void closeAfterFailedOpen(PageStore store, PageFile file) {
+        if (store != null && store.wal != null) {
+            store.fail(new IllegalStateException("open failed"));
+            store.close();
+        } else {
+            file.abandon();
+        }
+    }
+
+    // Redoes every group that ends after the checkpoint. Returns how many.
+    private int redo(List<Wal.Group> groups, long checkpoint) {
+        int redone = 0;
+        for (Wal.Group group : groups) {
+            if (group.endLsn() <= checkpoint) {
+                continue; // the checkpoint has it; the log reset after it just didn't happen
+            }
+            long lsn = group.endLsn();
+            Set<Integer> skipped = new HashSet<>();
+            Set<Integer> applied = new HashSet<>();
+            for (LogRecord r : LogRecord.decode(group.body())) {
+                if (r instanceof LogRecord.Meta meta) {
+                    allocator.restore(meta);
+                    if (Integer.compareUnsigned(meta.pageCount(), file.pageCount()) > 0) {
+                        file.setPageCount(meta.pageCount());
+                    }
+                    continue;
+                }
+                LogRecord.PageRecord p = (LogRecord.PageRecord) r;
+                if (skipped.contains(p.pageId())) {
+                    continue;
+                }
+                // An image never reads the page, so a torn copy on disk doesn't matter.
+                boolean image = p instanceof LogRecord.Image;
+                try (PageGuard page = image ? pool.pinBlank(p.pageId()) : pool.fetch(p.pageId())) {
+                    page.latchExclusive();
+                    ByteBuffer buffer = page.buffer();
+                    // Decided once per page per group: the first record stamps the LSN the rest would be compared to.
+                    if (!applied.contains(p.pageId()) && !image && PageHeader.pageLsn(buffer) >= lsn) {
+                        skipped.add(p.pageId());
+                        continue;
+                    }
+                    applied.add(p.pageId());
+                    p.apply(buffer);
+                    PageHeader.setPageLsn(buffer, lsn);
+                    page.markDirty();
+                }
+            }
+            redone++;
+        }
+        return redone;
     }
 
     public static Path logPath(Path path) {
@@ -75,6 +177,39 @@ public final class PageStore implements AutoCloseable {
 
     void endMtr() {
         changes.readLock().unlock();
+    }
+
+    /**
+     * Writes every changed page and makes the page file the new starting point for recovery, then empties the log.
+     * Waits for running mini-transactions and holds new ones back meanwhile. Not to be called inside one.
+     */
+    public void checkpoint() {
+        changes.writeLock().lock();
+        try {
+            checkUsable();
+            wal.flush();
+            // Pages first, forced, and only then the meta page that says they're there.
+            pool.flushAll();
+            long end = wal.endLsn();
+            file.setFreeListHead(allocator.freeHead);
+            file.setCatalogRoot(allocator.catalogRoot);
+            file.setCheckpointLsn(end);
+            file.sync();
+            wal.reset(end);
+            redoStart = end;
+        } catch (RuntimeException e) {
+            fail(e);
+            throw e;
+        } finally {
+            changes.writeLock().unlock();
+        }
+    }
+
+    /** Checkpoints if the log has grown past the configured size. Call between operations, not inside one. */
+    public void maybeCheckpoint() {
+        if (wal.size() >= config.checkpointLogBytes()) {
+            checkpoint();
+        }
     }
 
     public BufferPool pool() {
@@ -99,6 +234,11 @@ public final class PageStore implements AutoCloseable {
         }
     }
 
+    /** Bytes in the log since the last checkpoint. */
+    public long logSize() {
+        return wal.size();
+    }
+
     PageFile file() {
         return file;
     }
@@ -116,8 +256,12 @@ public final class PageStore implements AutoCloseable {
     }
 
     void flushTo(long lsn) {
+        Wal log = wal;
+        if (log == null) {
+            return; // recovery: the groups being redone were forced before redo began
+        }
         try {
-            wal.flushTo(lsn);
+            log.flushTo(lsn);
         } catch (RuntimeException e) {
             fail(e);
             throw e;
@@ -136,16 +280,45 @@ public final class PageStore implements AutoCloseable {
         if (failure != null) {
             throw new StorageFailedException("the store failed earlier and must be reopened", failure);
         }
+        if (closed) {
+            throw new IllegalStateException("store is closed");
+        }
     }
 
+    /** For tests: stops as a killed process would. Nothing more is written; the OS keeps what it already has. */
+    void crash() {
+        closed = true;
+        fail(new IllegalStateException("crashed"));
+        wal.abandon();
+        file.abandon();
+    }
+
+    /** Checkpoints and closes. After a failure, writes nothing but closes the files. Safe to call twice. */
     @Override
     public void close() {
+        if (closed) {
+            return;
+        }
+        RuntimeException checkpointFailure = null;
+        if (failure == null) {
+            try {
+                checkpoint();
+            } catch (RuntimeException e) {
+                checkpointFailure = e; // fail() ran, so the files are closed as after any failure
+            }
+        }
+        closed = true;
         if (failure != null) {
             // Only the log is trusted now: write nothing else.
             try {
-                wal.close();
+                if (wal != null) {
+                    wal.close();
+                }
             } finally {
                 file.abandon();
+            }
+            if (checkpointFailure != null) {
+                throw checkpointFailure;
             }
             return;
         }
@@ -157,17 +330,6 @@ public final class PageStore implements AutoCloseable {
             } finally {
                 file.close();
             }
-        }
-    }
-
-    private static FileChannel open(Path path, boolean create) {
-        try {
-            return create
-                    ? FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE,
-                            StandardOpenOption.CREATE_NEW)
-                    : FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
         }
     }
 }
