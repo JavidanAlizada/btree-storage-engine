@@ -5,6 +5,7 @@ import dev.storage.buffer.PageGuard;
 import dev.storage.page.PageType;
 import dev.storage.page.SlottedPage;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -140,6 +141,52 @@ public final class BTree {
             return true;
         } finally {
             lock.writeLock().unlock();
+        }
+    }
+
+    /** The entries in [from, to) in key order; null leaves that end unbounded. Close the cursor when done. */
+    public TreeCursor scan(byte[] from, byte[] to) {
+        return new TreeCursor(this, from, to);
+    }
+
+    /**
+     * Copies the entries from seek (inclusive) to the end of its leaf, stopping before to. If the leaf has nothing at
+     * or after seek, moves along the sibling links until a leaf does; that's safe because the tree lock is held for
+     * the whole call. Returns false if nothing can follow this batch.
+     */
+    boolean loadBatch(byte[] seek, byte[] to, List<byte[]> keys, List<byte[]> values) {
+        lock.readLock().lock();
+        try {
+            int id = descend(seek, new Path());
+            int from = -1;
+            while (true) {
+                try (PageGuard page = pool.fetch(id)) {
+                    page.latchShared();
+                    Node node = Node.of(page.buffer());
+                    if (from < 0) {
+                        int i = node.search(seek);
+                        from = i >= 0 ? i : -(i + 1);
+                    }
+                    for (int i = from; i < node.count(); i++) {
+                        byte[] key = node.key(i);
+                        if (to != null && Arrays.compareUnsigned(key, to) >= 0) {
+                            return false;
+                        }
+                        keys.add(key);
+                        values.add(node.value(i));
+                    }
+                    id = node.aux();
+                }
+                if (id == 0) {
+                    return false;
+                }
+                if (!keys.isEmpty()) {
+                    return true;
+                }
+                from = 0;
+            }
+        } finally {
+            lock.readLock().unlock();
         }
     }
 
