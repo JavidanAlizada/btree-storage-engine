@@ -115,6 +115,28 @@ public final class PageFile implements AutoCloseable {
         return pageCount;
     }
 
+    /** The root page of the catalog tree, or 0 if there's no catalog yet. */
+    public int catalogRoot() {
+        lock.lock();
+        try {
+            return meta.catalogRoot;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Records the catalog's root. It reaches disk with the next sync. */
+    public void setCatalogRoot(int root) {
+        checkUsable();
+        lock.lock();
+        try {
+            meta.catalogRoot = root;
+            metaDirty = true;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /** Reads page id into dst (capacity = page size) and verifies its checksum and id. */
     public void read(int id, ByteBuffer dst) {
         checkUsable();
