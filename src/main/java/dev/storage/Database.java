@@ -151,6 +151,14 @@ public final class Database implements AutoCloseable {
         store.close();
     }
 
+    BTree catalogTree() {
+        return catalog;
+    }
+
+    PageStore store() {
+        return store;
+    }
+
     void checkOpen() {
         if (closed) {
             throw new IllegalStateException("database is closed");

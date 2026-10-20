@@ -14,6 +14,7 @@ import java.lang.System.Logger.Level;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -67,13 +68,13 @@ public final class PageStore implements AutoCloseable {
     /** Opens the store at path, recovering it if needed, or creates it if the page file doesn't exist. */
     public static PageStore open(Path path, Config config, ChannelOpener opener) {
         boolean exists = Files.exists(path);
-        PageFile file = exists ? PageFile.open(path, opener) : PageFile.create(path, config.pageSize(), opener);
+        PageFile file = exists ? PageFile.open(path, opener) : createFiles(path, config.pageSize(), opener);
         PageStore store = null;
         try {
             store = new PageStore(file, config);
             Path logPath = logPath(path);
             if (!exists) {
-                store.wal = Wal.create(opener.open(logPath, true), file.checkpointLsn());
+                store.wal = Wal.open(opener.open(logPath, false), group -> { });
                 return store;
             }
             long checkpoint = file.checkpointLsn();
@@ -102,6 +103,35 @@ public final class PageStore implements AutoCloseable {
             throw new UncheckedIOException(e);
         } catch (RuntimeException e) {
             closeAfterFailedOpen(store, file);
+            throw e;
+        }
+    }
+
+    /**
+     * Creates the page file under a temporary name, then the log, then renames the page file into place. The rename is
+     * atomic, so the page file exists only once both are complete. A log with no page file is left from a creation
+     * that crashed and is replaced; so is a temporary page file.
+     */
+    private static PageFile createFiles(Path path, int pageSize, ChannelOpener opener) {
+        Path temporary = path.resolveSibling(path.getFileName() + ".creating");
+        Path logPath = logPath(path);
+        PageFile file = null;
+        try {
+            Files.deleteIfExists(temporary);
+            Files.deleteIfExists(logPath);
+            file = PageFile.create(temporary, pageSize, opener);
+            Wal.create(opener.open(logPath, true), file.checkpointLsn()).close();
+            Files.move(temporary, path, StandardCopyOption.ATOMIC_MOVE);
+            return file; // the open channel follows the file through the rename
+        } catch (IOException e) {
+            if (file != null) {
+                file.abandon();
+            }
+            throw new UncheckedIOException(e);
+        } catch (RuntimeException e) {
+            if (file != null) {
+                file.abandon();
+            }
             throw e;
         }
     }

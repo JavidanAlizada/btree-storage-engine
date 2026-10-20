@@ -33,7 +33,8 @@ public final class Wal implements AutoCloseable {
 
     static final int HEADER = 512;
     static final int FRAME = 16;
-    static final int DEFAULT_CHUNK = 4 << 20;
+    // Tests shrink it (dev.storage.walChunkBytes) so the many logs they create stay small.
+    static final int DEFAULT_CHUNK = Integer.getInteger("dev.storage.walChunkBytes", 4 << 20);
     private static final int MAGIC = 0x4254574C; // "BTWL"
     private static final int VERSION = 1;
     private static final int MAX_GROUP = 256 << 20;
@@ -134,7 +135,7 @@ public final class Wal implements AutoCloseable {
                 offset += FRAME + length;
             }
             long end = base + offset - HEADER;
-            zero(channel, offset, size);
+            zeroWhereNotZero(channel, offset, size);
             channel.force(true);
             return new Wal(channel, chunk, base, end, size);
         } catch (IOException e) {
@@ -356,6 +357,23 @@ public final class Wal implements AutoCloseable {
         crc.update(lsn);
         crc.update(body.duplicate());
         return (int) crc.getValue();
+    }
+
+    // Like zero, but writes only the blocks that aren't zero already: the preallocated tail usually is.
+    private static void zeroWhereNotZero(FileChannel channel, long from, long to) throws IOException {
+        ByteBuffer block = ByteBuffer.allocate(64 * 1024);
+        for (long at = from; at < to; at += block.capacity()) {
+            int length = (int) Math.min(block.capacity(), to - at);
+            block.clear().limit(length);
+            readFully(channel, block, at);
+            boolean clean = true;
+            for (int i = 0; i < length && clean; i++) {
+                clean = block.get(i) == 0;
+            }
+            if (!clean) {
+                zero(channel, at, at + length);
+            }
+        }
     }
 
     private static void zero(FileChannel channel, long from, long to) throws IOException {

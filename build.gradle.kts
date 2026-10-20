@@ -33,6 +33,8 @@ tasks.test {
     maxHeapSize = "1g"
     // Every mini-transaction commit replays its own log group and checks it rebuilds the same page bytes.
     systemProperty("dev.storage.redoCheck", "true")
+    // 64 KiB log chunks instead of 4 MiB: the crash tests create hundreds of logs.
+    systemProperty("dev.storage.walChunkBytes", "65536")
 }
 
 jacoco {

@@ -16,9 +16,9 @@ import java.util.Set;
  * separator bounds; all leaves at one depth; the leaf chain visits the leaves in key order and ends at 0; non-root
  * nodes are non-empty and at least a quarter full; no page is reachable twice.
  */
-final class TreeChecker {
+public final class TreeChecker {
 
-    record Result(int keys, int height, int pages) { }
+    public record Result(int keys, int height, int pages) { }
 
     private final BufferPool pool;
     private final int root;
@@ -32,7 +32,7 @@ final class TreeChecker {
         this.root = tree.rootPage();
     }
 
-    static Result check(BTree tree) {
+    public static Result check(BTree tree) {
         var checker = new TreeChecker(tree);
         checker.visit(checker.root, null, null, 0);
         checker.checkLeafChain();

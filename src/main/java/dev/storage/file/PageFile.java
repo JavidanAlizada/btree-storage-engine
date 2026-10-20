@@ -349,15 +349,18 @@ public final class PageFile implements AutoCloseable {
         }
     }
 
+    // Data pages are forced before the meta page is written: otherwise a crash could keep a meta page counting pages
+    // whose bytes never arrived (the OS writes back in any order). A longer file also needs its size forced.
     private void syncLocked() {
-        if (metaDirty) {
-            ByteBuffer page = ByteBuffer.allocate(pageSize);
-            meta.write(page);
-            writePage(0, page);
-            metaDirty = false;
-        }
         try {
-            // A longer file means its size changed, and the size is metadata.
+            if (metaDirty) {
+                channel.force(grew);
+                grew = false;
+                ByteBuffer page = ByteBuffer.allocate(pageSize);
+                meta.write(page);
+                writePage(0, page);
+                metaDirty = false;
+            }
             channel.force(grew);
             grew = false;
         } catch (IOException | RuntimeException e) {

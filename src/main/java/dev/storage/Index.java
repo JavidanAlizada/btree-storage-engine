@@ -44,6 +44,10 @@ public final class Index {
         return found;
     }
 
+    BTree tree() {
+        return tree;
+    }
+
     /** The entries in [from, to) in key order; a null bound means unbounded. Close the cursor when done. */
     public Cursor scan(byte[] from, byte[] to) {
         db.checkOpen();
